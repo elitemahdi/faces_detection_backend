@@ -7,179 +7,193 @@ SFACE_MODEL_PATH = Path("models/face_recognition_sface.onnx")
 ADAFACE_MODEL_PATH = Path("models/adaface_ir50.onnx")
 
 # Standard InsightFace / AdaFace 5-point landmark coordinates for 112x112 aligned crops
+# Coordinate-for-coordinate match with YuNet:
+# 1. Right Eye: [38.2946, 51.6963]
+# 2. Left Eye:  [73.5318, 51.5014]
+# 3. Nose Tip:  [56.0252, 71.7366]
+# 4. Right Mouth Corner: [41.5493, 92.3655]
+# 5. Left Mouth Corner:  [70.7299, 92.2041]
 REFERENCE_5_POINTS = np.array(
     [
-        [38.2946, 51.6963],  # Right eye
-        [73.5318, 51.5014],  # Left eye
-        [56.0252, 71.7366],  # Nose tip
-        [41.5493, 92.3655],  # Right mouth corner
-        [70.7299, 92.2041],  # Left mouth corner
+        [38.2946, 51.6963],  # Right Eye
+        [73.5318, 51.5014],  # Left Eye
+        [56.0252, 71.7366],  # Nose Tip
+        [41.5493, 92.3655],  # Right Mouth
+        [70.7299, 92.2041],  # Left Mouth
     ],
     dtype=np.float32,
 )
 
 
 class FaceRecognitionService:
-    """Face Recognition Service combining OpenCV YuNet face & 5-point landmark detector,
-    OpenCV similarity transform alignment to 112x112, and AdaFace / SFace 512-dim embedding.
+    """Thread-safe Face Recognition Service.
+    - Shares read-only thread-safe ONNX Runtime session for AdaFace across all threads.
+    - Provides dedicated per-thread OpenCV FaceDetectorYN instances via get_detector().
+    - Implements batched tensor inference, quality gating, and vectorized cosine similarity.
     """
 
     def __init__(self):
         if not YUNET_MODEL_PATH.exists():
-            raise RuntimeError(
-                f"Face detector model not found at {YUNET_MODEL_PATH}."
-            )
+            raise RuntimeError(f"Face detector model not found at {YUNET_MODEL_PATH}.")
 
-        # 1. Detector: OpenCV YuNet
-        self.detector = cv2.FaceDetectorYN.create(
-            model=str(YUNET_MODEL_PATH),
-            config="",
-            input_size=(320, 320),
-            score_threshold=0.6,
-            nms_threshold=0.3,
-            top_k=5000,
-        )
-
-        # 2. Recognizer: Check for AdaFace ONNX, fallback to OpenCV SFace
+        self.yunet_path = str(YUNET_MODEL_PATH)
         self.adaface_session = None
         self.input_name = None
         self._load_adaface_model()
 
-        # OpenCV SFace as recognizer & aligner fallback
-        self.recognizer = None
-        if SFACE_MODEL_PATH.exists():
+        # Fallback SFace recognizer model path
+        self.sface_path = str(SFACE_MODEL_PATH) if SFACE_MODEL_PATH.exists() else None
+        self.sface_recognizer = None
+        if self.sface_path:
             try:
-                self.recognizer = cv2.FaceRecognizerSF.create(
-                    model=str(SFACE_MODEL_PATH),
-                    config="",
-                )
+                self.sface_recognizer = cv2.FaceRecognizerSF.create(model=self.sface_path, config="")
             except Exception:
                 pass
 
     def _load_adaface_model(self):
-        """Attempts to load AdaFace IR-50 model via onnxruntime or OpenCV DNN."""
-        if not ADAFACE_MODEL_PATH.exists():
-            return
-
-        # Check if file is valid (> 10MB)
-        if ADAFACE_MODEL_PATH.stat().st_size < 10 * 1024 * 1024:
+        """Loads AdaFace ONNX runtime session with multi-threaded execution options."""
+        if not ADAFACE_MODEL_PATH.exists() or ADAFACE_MODEL_PATH.stat().st_size < 10 * 1024 * 1024:
             return
 
         try:
             import onnxruntime as ort
 
+            opts = ort.SessionOptions()
+            opts.intra_op_num_threads = 2
+            opts.inter_op_num_threads = 2
             self.adaface_session = ort.InferenceSession(
                 str(ADAFACE_MODEL_PATH),
+                sess_options=opts,
                 providers=["CPUExecutionProvider"],
             )
             self.input_name = self.adaface_session.get_inputs()[0].name
         except Exception:
-            try:
-                # Fallback to OpenCV DNN
-                self.adaface_net = cv2.dnn.readNetFromONNX(str(ADAFACE_MODEL_PATH))
-            except Exception:
-                pass
+            self.adaface_session = None
+
+    def get_detector(self, initial_size: tuple[int, int] = (320, 320)) -> cv2.FaceDetectorYN:
+        """Instantiates a dedicated, thread-safe FaceDetectorYN instance for the calling thread."""
+        return cv2.FaceDetectorYN.create(
+            model=self.yunet_path,
+            config="",
+            input_size=initial_size,
+            score_threshold=0.6,
+            nms_threshold=0.3,
+            top_k=5000,
+        )
 
     def align_and_crop(self, img: np.ndarray, face_info: np.ndarray) -> np.ndarray:
-        """Aligns and crops the face to 112x112 using OpenCV affine similarity transform
-        calculated from 5-point facial landmarks.
-        """
-        # Extract 5 landmarks: right eye, left eye, nose, right mouth, left mouth
+        """Aligns and crops the face to 112x112 using OpenCV similarity affine transform."""
         landmarks = np.array(
             [
-                [face_info[4], face_info[5]],
-                [face_info[6], face_info[7]],
-                [face_info[8], face_info[9]],
-                [face_info[10], face_info[11]],
-                [face_info[12], face_info[13]],
+                [face_info[4], face_info[5]],    # Right Eye
+                [face_info[6], face_info[7]],    # Left Eye
+                [face_info[8], face_info[9]],    # Nose Tip
+                [face_info[10], face_info[11]],  # Right Mouth
+                [face_info[12], face_info[13]],  # Left Mouth
             ],
             dtype=np.float32,
         )
 
-        # Estimate partial affine (similarity) transform matrix: scale, rotation, translation
         tfm, _ = cv2.estimateAffinePartial2D(landmarks, REFERENCE_5_POINTS)
-
         if tfm is not None:
-            aligned = cv2.warpAffine(
+            return cv2.warpAffine(
                 img,
                 tfm,
                 (112, 112),
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=(0, 0, 0),
             )
-            return aligned
 
         # Fallback using FaceRecognizerSF alignCrop if available
-        if self.recognizer is not None:
-            return self.recognizer.alignCrop(img, face_info)
+        if self.sface_recognizer is not None:
+            return self.sface_recognizer.alignCrop(img, face_info)
 
-        # Basic bounding box crop & resize fallback
+        # Fallback bounding box crop & resize
         x, y, w, h = face_info[:4].astype(int)
         ih, iw, _ = img.shape
         x, y = max(0, x), max(0, y)
         w, h = min(w, iw - x), min(h, ih - y)
         crop = img[y : y + h, x : x + w]
-        if crop.size > 0:
-            return cv2.resize(crop, (112, 112))
-        return np.zeros((112, 112, 3), dtype=np.uint8)
+        return cv2.resize(crop, (112, 112)) if crop.size > 0 else np.zeros((112, 112, 3), dtype=np.uint8)
 
     def extract_embedding(self, aligned_bgr_112: np.ndarray) -> list[float]:
-        """Extracts 512-dim L2-normalized feature embedding from 112x112 aligned face crop."""
+        """Extracts a single 512-dim L2-normalized embedding."""
+        return self.extract_batch_embeddings([aligned_bgr_112])[0]
+
+    def extract_batch_embeddings(self, aligned_crops: list[np.ndarray]) -> list[list[float]]:
+        """Extracts 512-dim L2-normalized feature embeddings from a batch of 112x112 aligned face crops.
+        - Transforms HWC (112, 112, 3) to CHW (3, 112, 112) and normalizes to [-1, 1].
+        - Evaluates the batch in a single forward ONNX inference call.
+        - Normalizes embeddings across the batch dimension.
+        """
+        if not aligned_crops:
+            return []
+
         # 1. AdaFace ONNX inference
         if self.adaface_session is not None and self.input_name is not None:
-            # Preprocessing: (x - 127.5) / 127.5, shape (1, 3, 112, 112)
-            blob = (aligned_bgr_112.astype(np.float32) - 127.5) / 127.5
-            blob = np.transpose(blob, (2, 0, 1))[np.newaxis, :]
+            batch = np.stack(
+                [
+                    np.transpose((c.astype(np.float32) - 127.5) / 127.5, (2, 0, 1))
+                    for c in aligned_crops
+                ],
+                axis=0,
+            )
+            outputs = self.adaface_session.run(None, {self.input_name: batch})[0]
 
-            output = self.adaface_session.run(None, {self.input_name: blob})[0]
-            embedding = output.flatten().astype(np.float32)
+            # Vectorized L2 normalization across batch dimension
+            norms = np.linalg.norm(outputs, axis=1, keepdims=True)
+            norms[norms < 1e-6] = 1.0
+            normalized = outputs / norms
+            return normalized.tolist()
 
-            # L2 normalization
-            norm = np.linalg.norm(embedding)
-            if norm > 1e-6:
-                embedding = embedding / norm
-            return embedding.tolist()
-
-        # 2. SFace fallback inference
-        if self.recognizer is not None:
-            feature = self.recognizer.feature(aligned_bgr_112).flatten()
-            norm = np.linalg.norm(feature)
-            if norm > 1e-6:
-                feature = feature / norm
-            return feature.tolist()
+        # 2. SFace fallback
+        if self.sface_recognizer is not None:
+            embeddings = []
+            for crop in aligned_crops:
+                feat = self.sface_recognizer.feature(crop).flatten()
+                n = np.linalg.norm(feat)
+                if n > 1e-6:
+                    feat = feat / n
+                embeddings.append(feat.tolist())
+            return embeddings
 
         raise RuntimeError("No face recognizer model (AdaFace or SFace) is active.")
 
-    def process_and_embed(
-        self, img: np.ndarray
-    ) -> list[tuple[np.ndarray, list[float]]]:
-        """Phase A & B Core Pipeline:
-        1. Grab/load image with OpenCV
-        2. Detect faces & 5-point landmarks with YuNet
-        3. Align and crop to 112x112 using OpenCV similarity transform
-        4. Pass into AdaFace to generate 512-dim normalized embedding
-        5. Returns list of (bbox [x, y, w, h], 512d_embedding)
-        """
+    def enroll_face(
+        self,
+        img: np.ndarray,
+        min_confidence: float = 0.90,
+        min_face_size: int = 100,
+    ) -> tuple[np.ndarray, list[float], float]:
+        """Thread-safe Phase A Registration Quality Gate."""
         h, w, _ = img.shape
-        self.detector.setInputSize((w, h))
+        detector = self.get_detector((w, h))
 
-        _, faces = self.detector.detect(img)
-        if faces is None:
-            return []
+        _, faces = detector.detect(img)
+        if faces is None or len(faces) == 0:
+            raise ValueError("No face detected in the photo. Please provide a clear portrait.")
+        if len(faces) > 1:
+            raise ValueError(
+                f"Multiple faces ({len(faces)}) detected. Please upload a photo with only one person."
+            )
 
-        results = []
-        for face in faces:
-            bbox = face[:4].astype(int)  # [x, y, w, h]
+        face = faces[0]
+        score = float(face[14]) if len(face) > 14 else 1.0
+        bx, by, bw, bh = face[:4].astype(int)
 
-            # 5-point alignment & 112x112 crop
-            aligned_face = self.align_and_crop(img, face)
+        if score < min_confidence:
+            raise ValueError(
+                f"Face detection confidence is too low ({score:.2f} < {min_confidence:.2f}). Please upload a clearer, well-lit photo."
+            )
 
-            # 512-dim AdaFace feature embedding
-            embedding_512d = self.extract_embedding(aligned_face)
+        if bw < min_face_size or bh < min_face_size:
+            raise ValueError(
+                f"Detected face resolution is too small ({bw}x{bh} px < {min_face_size}x{min_face_size} px). Please upload a closer portrait."
+            )
 
-            results.append((bbox, embedding_512d))
-
-        return results
+        aligned_face = self.align_and_crop(img, face)
+        embedding = self.extract_embedding(aligned_face)
+        return np.array([bx, by, bw, bh]), embedding, score
 
     @staticmethod
     def cosine_similarity(vec1: list[float] | np.ndarray, vec2: list[float] | np.ndarray) -> float:
@@ -191,3 +205,19 @@ class FaceRecognitionService:
         if n1 < 1e-6 or n2 < 1e-6:
             return 0.0
         return float(np.dot(v1, v2) / (n1 * n2))
+
+    @staticmethod
+    def batch_cosine_similarity(
+        query_vec: list[float] | np.ndarray,
+        enrolled_matrix: np.ndarray,
+    ) -> np.ndarray:
+        """Vectorized cosine similarity search across an entire matrix of enrolled embeddings (Q . E^T)."""
+        q = np.array(query_vec, dtype=np.float32)
+        qn = np.linalg.norm(q)
+        if qn > 1e-6:
+            q = q / qn
+        return np.dot(enrolled_matrix, q)
+
+
+# Global singleton instance (stateless & thread-safe)
+face_recognition_service = FaceRecognitionService()

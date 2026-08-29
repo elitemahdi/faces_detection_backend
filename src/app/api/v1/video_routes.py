@@ -34,10 +34,10 @@ async def process_video(
         description="Run detection every Nth frame (1 = every frame)",
     ),
     match_threshold: float = Query(
-        0.363,
+        0.38,
         ge=0.1,
         le=1.0,
-        description="Cosine similarity threshold for face recognition match",
+        description="Cosine similarity threshold for AdaFace face recognition match (typically 0.35 - 0.45)",
     ),
     db: AsyncSession = Depends(get_db),
 ):

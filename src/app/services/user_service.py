@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.user import User
 from app.repositories.user_repository import UserRepository
 from app.schemas.user import UserCreate, UserResponse, UserUpdate
-from app.services.face_recognition_service import FaceRecognitionService
+from app.services.face_recognition_service import face_recognition_service
 
 UPLOAD_DIR = Path("uploads/avatars")
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -20,15 +20,14 @@ class UserService:
 
     def __init__(self, session: AsyncSession):
         self.repository = UserRepository(session)
-        self.recognition_service = FaceRecognitionService()
+        self.recognition_service = face_recognition_service
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     async def _process_photo(
         self, photo: UploadFile
     ) -> tuple[str, list[float]]:
-        """Validates the uploaded photo, verifies face presence, extracts the 512-dim embedding,
-
-        and saves the file to disk.
+        """Validates the uploaded photo, verifies face presence and quality gate,
+        extracts the 512-dim embedding, and saves the file to disk.
         """
         file_ext = Path(photo.filename or "").suffix.lower()
         if file_ext not in ALLOWED_EXTENSIONS:
@@ -54,21 +53,16 @@ class UserService:
                 detail="Corrupt or unreadable image file.",
             )
 
-        # Detect face & generate embedding
-        detections = self.recognition_service.process_and_embed(img)
-        if len(detections) == 0:
+        # Production Quality Gate: Confidence >= 0.90, Face >= 100x100px, exactly 1 face
+        try:
+            _, embedding_512d, score = self.recognition_service.enroll_face(
+                img, min_confidence=0.90, min_face_size=100
+            )
+        except ValueError as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No face detected in the photo. Please provide a clear portrait.",
+                detail=str(e),
             )
-        if len(detections) > 1:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Multiple faces ({len(detections)}) detected. Please upload a photo with only one person.",
-            )
-
-        # Extract 512-d feature vector
-        _, embedding_512d = detections[0]
 
         # Save photo file to disk
         file_name = f"{uuid.uuid4()}{file_ext}"
