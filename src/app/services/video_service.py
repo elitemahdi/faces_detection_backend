@@ -101,10 +101,8 @@ class VideoProcessingService:
                     highest_score = -1.0
 
                     for user in known_users:
-                        score = self.recognition_service.recognizer.match(
-                            query_vec,
-                            user["embedding"],
-                            cv2.FaceRecognizerSF_FR_COSINE,
+                        score = self.recognition_service.cosine_similarity(
+                            query_vec, user["embedding"]
                         )
                         if score > highest_score:
                             highest_score = score
