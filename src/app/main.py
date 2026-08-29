@@ -12,3 +12,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Face Recognition Microservice", lifespan=lifespan)
 app.include_router(api_router, prefix="/api/v1")
+
+
+@app.get("/health", tags=["Health"])
+@app.get("/api/v1/health", tags=["Health"])
+async def health_check():
+    return {"status": "healthy", "service": "Face Recognition Microservice"}

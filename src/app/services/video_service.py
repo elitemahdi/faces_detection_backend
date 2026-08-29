@@ -1,4 +1,6 @@
+from datetime import datetime, timezone
 from pathlib import Path
+import json
 import tempfile
 import uuid
 import cv2
@@ -24,10 +26,11 @@ class VideoProcessingService:
         self,
         video_file: UploadFile,
         sample_rate: int = 1,
-    ) -> Path:
+        match_threshold: float = MATCH_THRESHOLD,
+    ) -> dict:
         """Processes an uploaded video, draws bounding boxes and labels for recognized
-
-        and unknown faces on each frame, and writes the output to an MP4 file.
+        and unknown faces on each frame, writes the output to an MP4 file, and returns
+        structured summary metrics.
         """
         # 1. Fetch registered users with embeddings from DB
         users = await self.repository.list_all(skip=0, limit=1000)
@@ -42,7 +45,8 @@ class VideoProcessingService:
         ]
 
         # 2. Save uploaded video to a temporary input file
-        suffix = Path(video_file.filename or "input.mp4").suffix or ".mp4"
+        original_filename = video_file.filename or "input.mp4"
+        suffix = Path(original_filename).suffix or ".mp4"
         with tempfile.NamedTemporaryFile(
             delete=False, suffix=suffix
         ) as temp_in:
@@ -60,11 +64,15 @@ class VideoProcessingService:
 
         # 3. Read video metadata
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        if fps <= 0:
+            fps = 30.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         # 4. Initialize VideoWriter with H.264 / mp4v codec
-        output_filename = f"annotated_{uuid.uuid4().hex}.mp4"
+        video_id = uuid.uuid4().hex[:12]
+        output_filename = f"annotated_{video_id}{suffix}"
         output_path = PROCESSED_DIR / output_filename
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(
@@ -72,6 +80,8 @@ class VideoProcessingService:
         )
 
         frame_idx = 0
+        total_detections = 0
+        recognized_users_set = set()
         last_detections = []
 
         while cap.isOpened():
@@ -85,6 +95,7 @@ class VideoProcessingService:
                 detections = self.recognition_service.process_and_embed(frame)
 
                 for bbox, embedding in detections:
+                    total_detections += 1
                     query_vec = np.array(embedding, dtype=np.float32)
                     best_match_user = None
                     highest_score = -1.0
@@ -100,9 +111,12 @@ class VideoProcessingService:
                             best_match_user = user
 
                     is_recognized = (
-                        highest_score >= MATCH_THRESHOLD
+                        highest_score >= match_threshold
                         and best_match_user is not None
                     )
+                    if is_recognized:
+                        recognized_users_set.add(best_match_user["name"])
+
                     label = (
                         f"{best_match_user['name']} ({highest_score:.2f})"
                         if is_recognized
@@ -144,4 +158,83 @@ class VideoProcessingService:
         writer.release()
         Path(temp_input_path).unlink(missing_ok=True)
 
-        return output_path
+        file_size = output_path.stat().st_size if output_path.exists() else 0
+        duration = frame_idx / fps if fps > 0 else 0.0
+        now = datetime.now(timezone.utc)
+
+        # Save metadata sidecar json
+        metadata = {
+            "video_id": video_id,
+            "original_filename": original_filename,
+            "annotated_filename": output_filename,
+            "download_url": f"/api/v1/videos/{video_id}/download",
+            "total_frames": frame_idx,
+            "fps": round(fps, 2),
+            "duration_seconds": round(duration, 2),
+            "total_detections": total_detections,
+            "recognized_users": sorted(list(recognized_users_set)),
+            "file_size_bytes": file_size,
+            "created_at": now.isoformat(),
+        }
+
+        meta_path = PROCESSED_DIR / f"{video_id}.json"
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+
+        return {
+            "output_path": output_path,
+            "metadata": metadata,
+        }
+
+    def list_processed_videos(self) -> list[dict]:
+        """Lists all processed videos stored in the processed directory."""
+        items = []
+        for meta_file in sorted(PROCESSED_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    items.append(data)
+            except Exception:
+                pass
+        return items
+
+    def get_video_file_path(self, video_id: str) -> Path:
+        """Finds the output video file path by video_id."""
+        meta_path = PROCESSED_DIR / f"{video_id}.json"
+        if meta_path.exists():
+            with open(meta_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                fn = data.get("annotated_filename")
+                if fn:
+                    p = PROCESSED_DIR / fn
+                    if p.exists():
+                        return p
+
+        # Fallback: search for annotated_{video_id}.*
+        matches = list(PROCESSED_DIR.glob(f"annotated_{video_id}*"))
+        if matches and matches[0].exists():
+            return matches[0]
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Processed video #{video_id} not found.",
+        )
+
+    def delete_processed_video(self, video_id: str) -> bool:
+        """Deletes a processed video and its metadata sidecar."""
+        meta_path = PROCESSED_DIR / f"{video_id}.json"
+        if meta_path.exists():
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    fn = data.get("annotated_filename")
+                    if fn:
+                        (PROCESSED_DIR / fn).unlink(missing_ok=True)
+            except Exception:
+                pass
+            meta_path.unlink(missing_ok=True)
+
+        for p in PROCESSED_DIR.glob(f"annotated_{video_id}*"):
+            p.unlink(missing_ok=True)
+
+        return True
