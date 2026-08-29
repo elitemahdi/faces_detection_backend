@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, Query, Response, status
+from fastapi import APIRouter, Depends, Query, Response, WebSocket, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -19,11 +20,11 @@ def get_camera_service(db: AsyncSession = Depends(get_db)) -> CameraService:
     summary="Register a new camera",
 )
 async def create_camera(
-        camera_in: CameraCreate,
-        verify_connection: bool = Query(
-            False, description="Attempt a test frame capture upon registration"
-        ),
-        service: CameraService = Depends(get_camera_service),
+    camera_in: CameraCreate,
+    verify_connection: bool = Query(
+        False, description="Attempt a test frame capture upon registration"
+    ),
+    service: CameraService = Depends(get_camera_service),
 ):
     return await service.register_camera(
         camera_in=camera_in, verify_connection=verify_connection
@@ -37,10 +38,10 @@ async def create_camera(
     summary="List all registered cameras",
 )
 async def list_cameras(
-        skip: int = Query(0, ge=0),
-        limit: int = Query(50, ge=1, le=100),
-        active_only: bool = Query(False),
-        service: CameraService = Depends(get_camera_service),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    active_only: bool = Query(False),
+    service: CameraService = Depends(get_camera_service),
 ):
     return await service.list_cameras(
         skip=skip, limit=limit, active_only=active_only
@@ -54,8 +55,8 @@ async def list_cameras(
     summary="Get camera details by ID",
 )
 async def get_camera(
-        camera_id: int,
-        service: CameraService = Depends(get_camera_service),
+    camera_id: int,
+    service: CameraService = Depends(get_camera_service),
 ):
     return await service.get_camera(camera_id=camera_id)
 
@@ -67,9 +68,9 @@ async def get_camera(
     summary="Update camera configuration",
 )
 async def update_camera(
-        camera_id: int,
-        camera_in: CameraUpdate,
-        service: CameraService = Depends(get_camera_service),
+    camera_id: int,
+    camera_in: CameraUpdate,
+    service: CameraService = Depends(get_camera_service),
 ):
     return await service.update_camera(
         camera_id=camera_id, camera_in=camera_in
@@ -82,8 +83,8 @@ async def update_camera(
     summary="Deactivate/delete a camera",
 )
 async def delete_camera(
-        camera_id: int,
-        service: CameraService = Depends(get_camera_service),
+    camera_id: int,
+    service: CameraService = Depends(get_camera_service),
 ):
     await service.delete_camera(camera_id=camera_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -95,7 +96,68 @@ async def delete_camera(
     summary="Test live feed connectivity for a camera",
 )
 async def test_camera_connection(
-        camera_id: int,
-        service: CameraService = Depends(get_camera_service),
+    camera_id: int,
+    service: CameraService = Depends(get_camera_service),
 ):
     return await service.test_camera(camera_id=camera_id)
+
+
+@router.get(
+    "/{camera_id}/stream",
+    summary="Stream live camera feed with real-time AI face recognition (MJPEG)",
+)
+async def stream_camera(
+    camera_id: int,
+    annotate: bool = Query(
+        True, description="Enable real-time AI face recognition annotations"
+    ),
+    threshold: float = Query(
+        0.38, description="AdaFace cosine similarity threshold"
+    ),
+    service: CameraService = Depends(get_camera_service),
+):
+    return StreamingResponse(
+        service.stream_camera_feed(
+            camera_id=camera_id,
+            annotate_faces=annotate,
+            match_threshold=threshold,
+        ),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@router.websocket("/{camera_id}/ws")
+async def websocket_camera_stream(
+    websocket: WebSocket,
+    camera_id: int,
+    annotate: bool = Query(True),
+    threshold: float = Query(0.38),
+    db: AsyncSession = Depends(get_db),
+):
+    """Real-time bidirectional WebSocket camera stream with AI face recognition."""
+    await websocket.accept()
+    service = CameraService(db)
+    await service.stream_camera_websocket(
+        websocket=websocket,
+        camera_id=camera_id,
+        annotate_faces=annotate,
+        match_threshold=threshold,
+    )
+
+
+@router.get(
+    "/{camera_id}/snapshot",
+    summary="Capture a single annotated snapshot image from the camera",
+)
+async def get_camera_snapshot(
+    camera_id: int,
+    annotate: bool = Query(True, description="Annotate recognized faces"),
+    threshold: float = Query(0.38, description="Matching threshold"),
+    service: CameraService = Depends(get_camera_service),
+):
+    jpeg_bytes = await service.get_snapshot(
+        camera_id=camera_id,
+        annotate_faces=annotate,
+        match_threshold=threshold,
+    )
+    return Response(content=jpeg_bytes, media_type="image/jpeg")
