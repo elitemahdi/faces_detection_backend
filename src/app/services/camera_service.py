@@ -7,8 +7,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.repositories.camera_repository import CameraRepository
 from app.repositories.user_repository import UserRepository
+from app.repositories.zone_repository import ZoneRepository
 from app.schemas.camera import CameraCreate, CameraResponse, CameraUpdate
 from app.services.face_recognition_service import face_recognition_service
+from app.services.zone_service import zone_engine
 
 MATCH_THRESHOLD = 0.38
 
@@ -19,6 +21,7 @@ class CameraService:
         self.session = session
         self.repository = CameraRepository(session)
         self.user_repository = UserRepository(session)
+        self.zone_repository = ZoneRepository(session)
         self.recognition_service = face_recognition_service
 
     @staticmethod
@@ -123,7 +126,7 @@ class CameraService:
         annotate_faces: bool = True,
         match_threshold: float = MATCH_THRESHOLD,
     ) -> AsyncGenerator[bytes, None]:
-        """Streams live camera frames via MJPEG multipart stream with real-time AI face recognition annotations."""
+        """Streams live camera frames via MJPEG multipart stream with real-time AI face recognition & zone rules."""
         camera = await self.repository.get_by_id(camera_id)
         if not camera:
             raise HTTPException(
@@ -131,12 +134,13 @@ class CameraService:
                 detail="Camera not found.",
             )
 
-        # 1. Preload enrolled users matrix for sub-millisecond matching
+        # 1. Preload enrolled users matrix for vectorized matching
         users = await self.user_repository.list_all(skip=0, limit=1000)
         known_users = [
             {
                 "id": u.id,
                 "name": u.full_name,
+                "role": u.role.value if hasattr(u.role, "value") else str(u.role),
                 "embedding": np.array(u.embedding, dtype=np.float32),
             }
             for u in users
@@ -152,6 +156,9 @@ class CameraService:
             enrolled_matrix = enrolled_matrix / norms
         else:
             enrolled_matrix = None
+
+        # 2. Preload active security zones for this camera
+        active_zones = await self.zone_repository.list_by_camera(camera_id, active_only=True)
 
         device_src = int(camera.source) if camera.source.isdigit() else camera.source
         cap = cv2.VideoCapture(device_src)
@@ -193,6 +200,7 @@ class CameraService:
 
             frame_count = 0
             last_annotations = []
+            last_breached_zones = set()
 
             while cap.isOpened():
                 ret, frame = cap.read()
@@ -203,22 +211,24 @@ class CameraService:
                 frame_count += 1
                 fh, fw, _ = frame.shape
 
+                # Prepare denormalized zone contours for current resolution
+                zones_with_contours = [
+                    (z, zone_engine.denormalize_points(z.coordinates, fw, fh))
+                    for z in active_zones
+                ]
+
                 if annotate_faces:
                     last_annotations = []
+                    last_breached_zones = set()
                     detector.setInputSize((fw, fh))
                     _, faces = detector.detect(frame)
 
                     if faces is not None and len(faces) > 0:
-                        bboxes = []
-                        crops = []
-                        for face in faces:
-                            bboxes.append(face[:4].astype(int))
-                            crops.append(
-                                self.recognition_service.align_and_crop(
-                                    frame, face
-                                )
-                            )
-
+                        bboxes = [f[:4].astype(int) for f in faces]
+                        crops = [
+                            self.recognition_service.align_and_crop(frame, f)
+                            for f in faces
+                        ]
                         embeddings = (
                             self.recognition_service.extract_batch_embeddings(
                                 crops
@@ -226,6 +236,9 @@ class CameraService:
                         )
 
                         for bbox, emb in zip(bboxes, embeddings):
+                            bx, by, bw, bh = bbox
+                            face_center = (bx + bw // 2, by + bh // 2)
+
                             best_match_user = None
                             highest_score = -1.0
 
@@ -243,21 +256,48 @@ class CameraService:
                                 highest_score >= match_threshold
                                 and best_match_user is not None
                             )
+
+                            # --- ZONE EVALUATION ---
+                            in_zone = False
                             label = (
                                 f"{best_match_user['name']} ({highest_score:.2f})"
                                 if is_rec
                                 else f"Unknown ({highest_score:.2f})"
                             )
                             color = (0, 255, 0) if is_rec else (0, 0, 255)
+
+                            for zone_obj, contour in zones_with_contours:
+                                if zone_engine.is_point_in_zone(face_center, contour):
+                                    in_zone = True
+                                    z_check = zone_engine.evaluate_zone_rule(
+                                        zone_type=zone_obj.zone_type,
+                                        matched_user=best_match_user,
+                                        is_recognized=is_rec,
+                                        face_detected=True,
+                                        zone_name=zone_obj.name,
+                                    )
+                                    color = z_check.color_bgr
+                                    label = z_check.message
+                                    if z_check.is_violation:
+                                        last_breached_zones.add(zone_obj.id)
+                                    break
+
                             last_annotations.append((bbox, label, color))
 
+                    # 1. Render semi-transparent zone polygons onto frame
+                    if zones_with_contours:
+                        frame = zone_engine.render_zones_on_frame(
+                            frame, zones_with_contours, last_breached_zones
+                        )
+
+                    # 2. Render face bounding boxes and violation tags
                     for bbox, label, color in last_annotations:
                         bx, by, bw, bh = bbox
                         cv2.rectangle(
                             frame, (bx, by), (bx + bw, by + bh), color, 2
                         )
                         (tw, th), _ = cv2.getTextSize(
-                            label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+                            label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1
                         )
                         cv2.rectangle(
                             frame,
@@ -271,10 +311,16 @@ class CameraService:
                             label,
                             (bx + 4, max(16, by - 6)),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
+                            0.48,
                             (255, 255, 255),
                             1,
                             cv2.LINE_AA,
+                        )
+                else:
+                    # Still render zone polygons if annotations are off but zones exist
+                    if zones_with_contours:
+                        frame = zone_engine.render_zones_on_frame(
+                            frame, zones_with_contours, set()
                         )
 
                 ret, buffer = cv2.imencode(
@@ -302,7 +348,7 @@ class CameraService:
         annotate_faces: bool = True,
         match_threshold: float = MATCH_THRESHOLD,
     ):
-        """Streams live camera frames via WebSocket binary stream with real-time AI face recognition and bidirectional controls."""
+        """Streams live camera frames via WebSocket with real-time AI face recognition, zone security policies, and bidirectional controls."""
         camera = await self.repository.get_by_id(camera_id)
         if not camera:
             await websocket.close(
@@ -316,6 +362,7 @@ class CameraService:
             {
                 "id": u.id,
                 "name": u.full_name,
+                "role": u.role.value if hasattr(u.role, "value") else str(u.role),
                 "embedding": np.array(u.embedding, dtype=np.float32),
             }
             for u in users
@@ -331,6 +378,8 @@ class CameraService:
             enrolled_matrix = enrolled_matrix / norms
         else:
             enrolled_matrix = None
+
+        active_zones = await self.zone_repository.list_by_camera(camera_id, active_only=True)
 
         device_src = int(camera.source) if camera.source.isdigit() else camera.source
         cap = cv2.VideoCapture(device_src)
@@ -362,7 +411,6 @@ class CameraService:
         current_annotate = annotate_faces
         current_threshold = match_threshold
 
-        # Receive bidirectional control messages in parallel task
         async def receive_client_controls():
             nonlocal current_annotate, current_threshold
             try:
@@ -383,6 +431,7 @@ class CameraService:
         try:
             frame_count = 0
             last_annotations = []
+            last_breached_zones = set()
 
             while cap.isOpened():
                 ret, frame = cap.read()
@@ -393,8 +442,14 @@ class CameraService:
                 frame_count += 1
                 fh, fw, _ = frame.shape
 
+                zones_with_contours = [
+                    (z, zone_engine.denormalize_points(z.coordinates, fw, fh))
+                    for z in active_zones
+                ]
+
                 if current_annotate:
                     last_annotations = []
+                    last_breached_zones = set()
                     detector.setInputSize((fw, fh))
                     _, faces = detector.detect(frame)
 
@@ -411,6 +466,9 @@ class CameraService:
                         )
 
                         for bbox, emb in zip(bboxes, embeddings):
+                            bx, by, bw, bh = bbox
+                            face_center = (bx + bw // 2, by + bh // 2)
+
                             best_match_user = None
                             highest_score = -1.0
 
@@ -428,13 +486,35 @@ class CameraService:
                                 highest_score >= current_threshold
                                 and best_match_user is not None
                             )
+
                             label = (
                                 f"{best_match_user['name']} ({highest_score:.2f})"
                                 if is_rec
                                 else f"Unknown ({highest_score:.2f})"
                             )
                             color = (0, 255, 0) if is_rec else (0, 0, 255)
+
+                            for zone_obj, contour in zones_with_contours:
+                                if zone_engine.is_point_in_zone(face_center, contour):
+                                    z_check = zone_engine.evaluate_zone_rule(
+                                        zone_type=zone_obj.zone_type,
+                                        matched_user=best_match_user,
+                                        is_recognized=is_rec,
+                                        face_detected=True,
+                                        zone_name=zone_obj.name,
+                                    )
+                                    color = z_check.color_bgr
+                                    label = z_check.message
+                                    if z_check.is_violation:
+                                        last_breached_zones.add(zone_obj.id)
+                                    break
+
                             last_annotations.append((bbox, label, color))
+
+                    if zones_with_contours:
+                        frame = zone_engine.render_zones_on_frame(
+                            frame, zones_with_contours, last_breached_zones
+                        )
 
                     for bbox, label, color in last_annotations:
                         bx, by, bw, bh = bbox
@@ -442,7 +522,7 @@ class CameraService:
                             frame, (bx, by), (bx + bw, by + bh), color, 2
                         )
                         (tw, th), _ = cv2.getTextSize(
-                            label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+                            label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1
                         )
                         cv2.rectangle(
                             frame,
@@ -456,10 +536,15 @@ class CameraService:
                             label,
                             (bx + 4, max(16, by - 6)),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
+                            0.48,
                             (255, 255, 255),
                             1,
                             cv2.LINE_AA,
+                        )
+                else:
+                    if zones_with_contours:
+                        frame = zone_engine.render_zones_on_frame(
+                            frame, zones_with_contours, set()
                         )
 
                 ret, buffer = cv2.imencode(
@@ -484,7 +569,7 @@ class CameraService:
         annotate_faces: bool = True,
         match_threshold: float = MATCH_THRESHOLD,
     ) -> bytes:
-        """Captures a single annotated JPEG frame from the camera."""
+        """Captures a single annotated JPEG frame from the camera with zone policies."""
         camera = await self.repository.get_by_id(camera_id)
         if not camera:
             raise HTTPException(
@@ -509,15 +594,27 @@ class CameraService:
                 detail="Failed to capture frame from camera.",
             )
 
+        fh, fw, _ = frame.shape
+        active_zones = await self.zone_repository.list_by_camera(camera_id, active_only=True)
+        zones_with_contours = [
+            (z, zone_engine.denormalize_points(z.coordinates, fw, fh))
+            for z in active_zones
+        ]
+
         if annotate_faces:
-            fh, fw, _ = frame.shape
             detector = self.recognition_service.get_detector((fw, fh))
             _, faces = detector.detect(frame)
+            breached_zones = set()
 
             if faces is not None and len(faces) > 0:
                 users = await self.user_repository.list_all(skip=0, limit=1000)
                 known_users = [
-                    {"id": u.id, "name": u.full_name, "embedding": np.array(u.embedding, dtype=np.float32)}
+                    {
+                        "id": u.id,
+                        "name": u.full_name,
+                        "role": u.role.value if hasattr(u.role, "value") else str(u.role),
+                        "embedding": np.array(u.embedding, dtype=np.float32),
+                    }
                     for u in users if u.embedding is not None
                 ]
                 if known_users:
@@ -533,6 +630,9 @@ class CameraService:
                 embeddings = self.recognition_service.extract_batch_embeddings(crops)
 
                 for bbox, emb in zip(bboxes, embeddings):
+                    bx, by, bw, bh = bbox
+                    face_center = (bx + bw // 2, by + bh // 2)
+
                     best_match_user = None
                     highest_score = -1.0
                     if enrolled_matrix is not None and len(known_users) > 0:
@@ -545,11 +645,31 @@ class CameraService:
                     label = f"{best_match_user['name']} ({highest_score:.2f})" if is_rec else f"Unknown ({highest_score:.2f})"
                     color = (0, 255, 0) if is_rec else (0, 0, 255)
 
-                    bx, by, bw, bh = bbox
+                    for zone_obj, contour in zones_with_contours:
+                        if zone_engine.is_point_in_zone(face_center, contour):
+                            z_check = zone_engine.evaluate_zone_rule(
+                                zone_type=zone_obj.zone_type,
+                                matched_user=best_match_user,
+                                is_recognized=is_rec,
+                                face_detected=True,
+                                zone_name=zone_obj.name,
+                            )
+                            color = z_check.color_bgr
+                            label = z_check.message
+                            if z_check.is_violation:
+                                breached_zones.add(zone_obj.id)
+                            break
+
                     cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), color, 2)
-                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
                     cv2.rectangle(frame, (bx, max(0, by - 22)), (bx + tw + 8, max(22, by)), color, -1)
-                    cv2.putText(frame, label, (bx + 4, max(16, by - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.putText(frame, label, (bx + 4, max(16, by - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+
+            if zones_with_contours:
+                frame = zone_engine.render_zones_on_frame(frame, zones_with_contours, breached_zones)
+        else:
+            if zones_with_contours:
+                frame = zone_engine.render_zones_on_frame(frame, zones_with_contours, set())
 
         ret, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         return buffer.tobytes()
