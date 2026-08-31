@@ -49,4 +49,10 @@ class Zone(Base):
         DateTime(timezone=True), nullable=True
     )
 
-    camera = relationship("Camera", backref="zones")
+    camera = relationship("Camera", back_populates="zones")
+    detection_events = relationship(
+        "DetectionEvent",
+        back_populates="zone",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )

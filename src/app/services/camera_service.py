@@ -5,7 +5,9 @@ import numpy as np
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.database import AsyncSessionLocal
 from app.repositories.camera_repository import CameraRepository
+from app.repositories.detection_event_repository import DetectionEventRepository
 from app.repositories.user_repository import UserRepository
 from app.repositories.zone_repository import ZoneRepository
 from app.schemas.camera import CameraCreate, CameraResponse, CameraUpdate
@@ -15,13 +17,36 @@ from app.services.zone_service import zone_engine
 MATCH_THRESHOLD = 0.38
 
 
+
+async def _persist_detection_events(events: list[dict]) -> None:
+    """Asynchronously logs live spatial detection events to the database without blocking the video stream."""
+    if not events:
+        return
+    try:
+        async with AsyncSessionLocal() as session:
+            repo = DetectionEventRepository(session)
+            await repo.bulk_log_events(events)
+    except Exception as exc:
+        print(f"[WARN] Failed to persist live detection events: {exc}")
+
+
 class CameraService:
+    _latest_raw_frames: dict[int, np.ndarray] = {}
+
+    @classmethod
+    def get_cached_frame(cls, camera_id: int) -> np.ndarray | None:
+        return cls._latest_raw_frames.get(camera_id)
+
+    @classmethod
+    def set_cached_frame(cls, camera_id: int, frame: np.ndarray) -> None:
+        cls._latest_raw_frames[camera_id] = frame
 
     def __init__(self, session: AsyncSession):
         self.session = session
         self.repository = CameraRepository(session)
         self.user_repository = UserRepository(session)
         self.zone_repository = ZoneRepository(session)
+        self.event_repository = DetectionEventRepository(session)
         self.recognition_service = face_recognition_service
 
     @staticmethod
@@ -199,14 +224,21 @@ class CameraService:
             detector = self.recognition_service.get_detector((w, h))
 
             frame_count = 0
+            fail_count = 0
             last_annotations = []
             last_breached_zones = set()
 
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
-                    await asyncio.sleep(0.04)
+                    fail_count += 1
+                    if fail_count > 30:
+                        break
+                    await asyncio.sleep(0.05)
                     continue
+
+                fail_count = 0
+                self.set_cached_frame(camera_id, frame)
 
                 frame_count += 1
                 fh, fw, _ = frame.shape
@@ -235,6 +267,7 @@ class CameraService:
                             )
                         )
 
+                        events_to_log = []
                         for bbox, emb in zip(bboxes, embeddings):
                             bx, by, bw, bh = bbox
                             face_center = (bx + bw // 2, by + bh // 2)
@@ -259,6 +292,7 @@ class CameraService:
 
                             # --- ZONE EVALUATION ---
                             in_zone = False
+                            matched_zone_id = None
                             label = (
                                 f"{best_match_user['name']} ({highest_score:.2f})"
                                 if is_rec
@@ -269,6 +303,7 @@ class CameraService:
                             for zone_obj, contour in zones_with_contours:
                                 if zone_engine.is_point_in_zone(face_center, contour):
                                     in_zone = True
+                                    matched_zone_id = zone_obj.id
                                     z_check = zone_engine.evaluate_zone_rule(
                                         zone_type=zone_obj.zone_type,
                                         matched_user=best_match_user,
@@ -283,6 +318,22 @@ class CameraService:
                                     break
 
                             last_annotations.append((bbox, label, color))
+
+                            # Prepare spatial event for heatmap logging
+                            events_to_log.append({
+                                "camera_id": camera_id,
+                                "user_id": best_match_user["id"] if is_rec else None,
+                                "user_name": best_match_user["name"] if is_rec else None,
+                                "norm_x": round(float(face_center[0]) / fw, 4),
+                                "norm_y": round(float(face_center[1]) / fh, 4),
+                                "confidence": round(float(highest_score if is_rec else 0.5), 2),
+                                "is_recognized": is_rec,
+                                "zone_id": matched_zone_id,
+                            })
+
+                        # Sample detection event logging every 10 frames (~3x per sec)
+                        if frame_count % 10 == 0 and events_to_log:
+                            asyncio.create_task(_persist_detection_events(events_to_log))
 
                     # 1. Render semi-transparent zone polygons onto frame
                     if zones_with_contours:
@@ -339,6 +390,7 @@ class CameraService:
                 await asyncio.sleep(0.033)
 
         finally:
+            self._latest_raw_frames.pop(camera_id, None)
             cap.release()
 
     async def stream_camera_websocket(
@@ -430,14 +482,21 @@ class CameraService:
 
         try:
             frame_count = 0
+            fail_count = 0
             last_annotations = []
             last_breached_zones = set()
 
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
-                    await asyncio.sleep(0.04)
+                    fail_count += 1
+                    if fail_count > 30:
+                        break
+                    await asyncio.sleep(0.05)
                     continue
+
+                fail_count = 0
+                self.set_cached_frame(camera_id, frame)
 
                 frame_count += 1
                 fh, fw, _ = frame.shape
@@ -465,6 +524,7 @@ class CameraService:
                             )
                         )
 
+                        ws_events_to_log = []
                         for bbox, emb in zip(bboxes, embeddings):
                             bx, by, bw, bh = bbox
                             face_center = (bx + bw // 2, by + bh // 2)
@@ -487,6 +547,8 @@ class CameraService:
                                 and best_match_user is not None
                             )
 
+                            in_zone = False
+                            matched_zone_id = None
                             label = (
                                 f"{best_match_user['name']} ({highest_score:.2f})"
                                 if is_rec
@@ -496,6 +558,8 @@ class CameraService:
 
                             for zone_obj, contour in zones_with_contours:
                                 if zone_engine.is_point_in_zone(face_center, contour):
+                                    in_zone = True
+                                    matched_zone_id = zone_obj.id
                                     z_check = zone_engine.evaluate_zone_rule(
                                         zone_type=zone_obj.zone_type,
                                         matched_user=best_match_user,
@@ -510,6 +574,22 @@ class CameraService:
                                     break
 
                             last_annotations.append((bbox, label, color))
+
+                            # Prepare spatial event for heatmap logging
+                            ws_events_to_log.append({
+                                "camera_id": camera_id,
+                                "user_id": best_match_user["id"] if is_rec else None,
+                                "user_name": best_match_user["name"] if is_rec else None,
+                                "norm_x": round(float(face_center[0]) / fw, 4),
+                                "norm_y": round(float(face_center[1]) / fh, 4),
+                                "confidence": round(float(highest_score if is_rec else 0.5), 2),
+                                "is_recognized": is_rec,
+                                "zone_id": matched_zone_id,
+                            })
+
+                        # Sample detection event logging every 10 frames (~3x per sec)
+                        if frame_count % 10 == 0 and ws_events_to_log:
+                            asyncio.create_task(_persist_detection_events(ws_events_to_log))
 
                     if zones_with_contours:
                         frame = zone_engine.render_zones_on_frame(
@@ -560,6 +640,7 @@ class CameraService:
         except Exception:
             pass
         finally:
+            self._latest_raw_frames.pop(camera_id, None)
             recv_task.cancel()
             cap.release()
 
