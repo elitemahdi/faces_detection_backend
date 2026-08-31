@@ -1,5 +1,6 @@
 import asyncio
 from typing import AsyncGenerator
+
 import cv2
 import numpy as np
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect, status
@@ -12,10 +13,10 @@ from app.repositories.user_repository import UserRepository
 from app.repositories.zone_repository import ZoneRepository
 from app.schemas.camera import CameraCreate, CameraResponse, CameraUpdate
 from app.services.face_recognition_service import face_recognition_service
+from app.services.tracking_service import FaceTrackerManager
 from app.services.zone_service import zone_engine
 
 MATCH_THRESHOLD = 0.38
-
 
 
 async def _persist_detection_events(events: list[dict]) -> None:
@@ -61,7 +62,7 @@ class CameraService:
         return ret
 
     async def register_camera(
-        self, camera_in: CameraCreate, verify_connection: bool = False
+            self, camera_in: CameraCreate, verify_connection: bool = False
     ) -> CameraResponse:
         existing = await self.repository.get_by_name(camera_in.name)
         if existing:
@@ -91,7 +92,7 @@ class CameraService:
         return CameraResponse.model_validate(camera)
 
     async def list_cameras(
-        self, skip: int = 0, limit: int = 50, active_only: bool = False
+            self, skip: int = 0, limit: int = 50, active_only: bool = False
     ) -> list[CameraResponse]:
         cameras = await self.repository.list_all(
             skip=skip, limit=limit, active_only=active_only
@@ -99,7 +100,7 @@ class CameraService:
         return [CameraResponse.model_validate(cam) for cam in cameras]
 
     async def update_camera(
-        self, camera_id: int, camera_in: CameraUpdate
+            self, camera_id: int, camera_in: CameraUpdate
     ) -> CameraResponse:
         camera = await self.repository.get_by_id(camera_id)
         if not camera:
@@ -146,10 +147,10 @@ class CameraService:
         }
 
     async def stream_camera_feed(
-        self,
-        camera_id: int,
-        annotate_faces: bool = True,
-        match_threshold: float = MATCH_THRESHOLD,
+            self,
+            camera_id: int,
+            annotate_faces: bool = True,
+            match_threshold: float = MATCH_THRESHOLD,
     ) -> AsyncGenerator[bytes, None]:
         """Streams live camera frames via MJPEG multipart stream with real-time AI face recognition & zone rules."""
         camera = await self.repository.get_by_id(camera_id)
@@ -212,16 +213,20 @@ class CameraService:
                 ret, buf = cv2.imencode(".jpg", err_frame)
                 if ret:
                     yield (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n\r\n"
-                        + buf.tobytes()
-                        + b"\r\n"
+                            b"--frame\r\n"
+                            b"Content-Type: image/jpeg\r\n\r\n"
+                            + buf.tobytes()
+                            + b"\r\n"
                     )
                 return
 
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
             detector = self.recognition_service.get_detector((w, h))
+            tracker_manager = FaceTrackerManager(
+                fps=30,
+                recheck_interval_frames=60,
+            )
 
             frame_count = 0
             fail_count = 0
@@ -253,87 +258,61 @@ class CameraService:
                     last_annotations = []
                     last_breached_zones = set()
                     detector.setInputSize((fw, fh))
-                    _, faces = detector.detect(frame)
+                    _, raw_faces = detector.detect(frame)
 
-                    if faces is not None and len(faces) > 0:
-                        bboxes = [f[:4].astype(int) for f in faces]
-                        crops = [
-                            self.recognition_service.align_and_crop(frame, f)
-                            for f in faces
-                        ]
-                        embeddings = (
-                            self.recognition_service.extract_batch_embeddings(
-                                crops
-                            )
-                        )
+                    tracked_faces = tracker_manager.update(
+                        frame=frame,
+                        raw_faces=raw_faces,
+                        recognition_service=self.recognition_service,
+                        enrolled_matrix=enrolled_matrix,
+                        known_users=known_users,
+                        match_threshold=match_threshold,
+                    )
 
-                        events_to_log = []
-                        for bbox, emb in zip(bboxes, embeddings):
-                            bx, by, bw, bh = bbox
-                            face_center = (bx + bw // 2, by + bh // 2)
+                    events_to_log = []
+                    for tf in tracked_faces:
+                        bx, by, bw, bh = tf.bbox_xywh
+                        face_center = (bx + bw // 2, by + bh // 2)
 
-                            best_match_user = None
-                            highest_score = -1.0
+                        in_zone = False
+                        matched_zone_id = None
+                        label = f"ID:{tf.track_id} | {tf.name} ({tf.confidence:.2f})"
+                        color = tf.color_bgr
 
-                            if enrolled_matrix is not None and len(known_users) > 0:
-                                sims = (
-                                    self.recognition_service.batch_cosine_similarity(
-                                        emb, enrolled_matrix
-                                    )
+                        for zone_obj, contour in zones_with_contours:
+                            if zone_engine.is_point_in_zone(face_center, contour):
+                                in_zone = True
+                                matched_zone_id = zone_obj.id
+                                z_check = zone_engine.evaluate_zone_rule(
+                                    zone_type=zone_obj.zone_type,
+                                    matched_user=tf.user_data,
+                                    is_recognized=tf.is_recognized,
+                                    face_detected=True,
+                                    zone_name=zone_obj.name,
                                 )
-                                best_idx = int(np.argmax(sims))
-                                highest_score = float(sims[best_idx])
-                                best_match_user = known_users[best_idx]
+                                color = z_check.color_bgr
+                                label = f"ID:{tf.track_id} | {z_check.message}"
+                                if z_check.is_violation:
+                                    last_breached_zones.add(zone_obj.id)
+                                break
 
-                            is_rec = (
-                                highest_score >= match_threshold
-                                and best_match_user is not None
-                            )
+                        last_annotations.append((tf.bbox_xywh, label, color))
 
-                            # --- ZONE EVALUATION ---
-                            in_zone = False
-                            matched_zone_id = None
-                            label = (
-                                f"{best_match_user['name']} ({highest_score:.2f})"
-                                if is_rec
-                                else f"Unknown ({highest_score:.2f})"
-                            )
-                            color = (0, 255, 0) if is_rec else (0, 0, 255)
+                        # Prepare spatial event for heatmap logging
+                        events_to_log.append({
+                            "camera_id": camera_id,
+                            "user_id": tf.user_data["id"] if (tf.is_recognized and tf.user_data) else None,
+                            "user_name": tf.name if tf.is_recognized else None,
+                            "norm_x": round(float(face_center[0]) / fw, 4),
+                            "norm_y": round(float(face_center[1]) / fh, 4),
+                            "confidence": round(float(tf.confidence), 2),
+                            "is_recognized": tf.is_recognized,
+                            "zone_id": matched_zone_id,
+                        })
 
-                            for zone_obj, contour in zones_with_contours:
-                                if zone_engine.is_point_in_zone(face_center, contour):
-                                    in_zone = True
-                                    matched_zone_id = zone_obj.id
-                                    z_check = zone_engine.evaluate_zone_rule(
-                                        zone_type=zone_obj.zone_type,
-                                        matched_user=best_match_user,
-                                        is_recognized=is_rec,
-                                        face_detected=True,
-                                        zone_name=zone_obj.name,
-                                    )
-                                    color = z_check.color_bgr
-                                    label = z_check.message
-                                    if z_check.is_violation:
-                                        last_breached_zones.add(zone_obj.id)
-                                    break
-
-                            last_annotations.append((bbox, label, color))
-
-                            # Prepare spatial event for heatmap logging
-                            events_to_log.append({
-                                "camera_id": camera_id,
-                                "user_id": best_match_user["id"] if is_rec else None,
-                                "user_name": best_match_user["name"] if is_rec else None,
-                                "norm_x": round(float(face_center[0]) / fw, 4),
-                                "norm_y": round(float(face_center[1]) / fh, 4),
-                                "confidence": round(float(highest_score if is_rec else 0.5), 2),
-                                "is_recognized": is_rec,
-                                "zone_id": matched_zone_id,
-                            })
-
-                        # Sample detection event logging every 10 frames (~3x per sec)
-                        if frame_count % 10 == 0 and events_to_log:
-                            asyncio.create_task(_persist_detection_events(events_to_log))
+                    # Sample detection event logging every 10 frames (~3x per sec)
+                    if frame_count % 10 == 0 and events_to_log:
+                        asyncio.create_task(_persist_detection_events(events_to_log))
 
                     # 1. Render semi-transparent zone polygons onto frame
                     if zones_with_contours:
@@ -381,10 +360,10 @@ class CameraService:
                     continue
 
                 yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n"
-                    + buffer.tobytes()
-                    + b"\r\n"
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n\r\n"
+                        + buffer.tobytes()
+                        + b"\r\n"
                 )
 
                 await asyncio.sleep(0.033)
@@ -394,11 +373,11 @@ class CameraService:
             cap.release()
 
     async def stream_camera_websocket(
-        self,
-        websocket: WebSocket,
-        camera_id: int,
-        annotate_faces: bool = True,
-        match_threshold: float = MATCH_THRESHOLD,
+            self,
+            websocket: WebSocket,
+            camera_id: int,
+            annotate_faces: bool = True,
+            match_threshold: float = MATCH_THRESHOLD,
     ):
         """Streams live camera frames via WebSocket with real-time AI face recognition, zone security policies, and bidirectional controls."""
         camera = await self.repository.get_by_id(camera_id)
@@ -481,6 +460,10 @@ class CameraService:
         recv_task = asyncio.create_task(receive_client_controls())
 
         try:
+            tracker_manager = FaceTrackerManager(
+                fps=30,
+                recheck_interval_frames=60,
+            )
             frame_count = 0
             fail_count = 0
             last_annotations = []
@@ -510,86 +493,61 @@ class CameraService:
                     last_annotations = []
                     last_breached_zones = set()
                     detector.setInputSize((fw, fh))
-                    _, faces = detector.detect(frame)
+                    _, raw_faces = detector.detect(frame)
 
-                    if faces is not None and len(faces) > 0:
-                        bboxes = [f[:4].astype(int) for f in faces]
-                        crops = [
-                            self.recognition_service.align_and_crop(frame, f)
-                            for f in faces
-                        ]
-                        embeddings = (
-                            self.recognition_service.extract_batch_embeddings(
-                                crops
-                            )
-                        )
+                    tracked_faces = tracker_manager.update(
+                        frame=frame,
+                        raw_faces=raw_faces,
+                        recognition_service=self.recognition_service,
+                        enrolled_matrix=enrolled_matrix,
+                        known_users=known_users,
+                        match_threshold=current_threshold,
+                    )
 
-                        ws_events_to_log = []
-                        for bbox, emb in zip(bboxes, embeddings):
-                            bx, by, bw, bh = bbox
-                            face_center = (bx + bw // 2, by + bh // 2)
+                    ws_events_to_log = []
+                    for tf in tracked_faces:
+                        bx, by, bw, bh = tf.bbox_xywh
+                        face_center = (bx + bw // 2, by + bh // 2)
 
-                            best_match_user = None
-                            highest_score = -1.0
+                        in_zone = False
+                        matched_zone_id = None
+                        label = f"ID:{tf.track_id} | {tf.name} ({tf.confidence:.2f})"
+                        color = tf.color_bgr
 
-                            if enrolled_matrix is not None and len(known_users) > 0:
-                                sims = (
-                                    self.recognition_service.batch_cosine_similarity(
-                                        emb, enrolled_matrix
-                                    )
+                        for zone_obj, contour in zones_with_contours:
+                            if zone_engine.is_point_in_zone(face_center, contour):
+                                in_zone = True
+                                matched_zone_id = zone_obj.id
+                                z_check = zone_engine.evaluate_zone_rule(
+                                    zone_type=zone_obj.zone_type,
+                                    matched_user=tf.user_data,
+                                    is_recognized=tf.is_recognized,
+                                    face_detected=True,
+                                    zone_name=zone_obj.name,
                                 )
-                                best_idx = int(np.argmax(sims))
-                                highest_score = float(sims[best_idx])
-                                best_match_user = known_users[best_idx]
+                                color = z_check.color_bgr
+                                label = f"ID:{tf.track_id} | {z_check.message}"
+                                if z_check.is_violation:
+                                    last_breached_zones.add(zone_obj.id)
+                                break
 
-                            is_rec = (
-                                highest_score >= current_threshold
-                                and best_match_user is not None
-                            )
+                        last_annotations.append((tf.bbox_xywh, label, color))
 
-                            in_zone = False
-                            matched_zone_id = None
-                            label = (
-                                f"{best_match_user['name']} ({highest_score:.2f})"
-                                if is_rec
-                                else f"Unknown ({highest_score:.2f})"
-                            )
-                            color = (0, 255, 0) if is_rec else (0, 0, 255)
+                        # Prepare spatial event for heatmap logging
+                        ws_events_to_log.append({
+                            "camera_id": camera_id,
+                            "user_id": tf.user_data["id"] if (tf.is_recognized and tf.user_data) else None,
+                            "user_name": tf.name if tf.is_recognized else None,
+                            "norm_x": round(float(face_center[0]) / fw, 4),
+                            "norm_y": round(float(face_center[1]) / fh, 4),
+                            "confidence": round(float(tf.confidence), 2),
+                            "is_recognized": tf.is_recognized,
+                            "zone_id": matched_zone_id,
+                        })
 
-                            for zone_obj, contour in zones_with_contours:
-                                if zone_engine.is_point_in_zone(face_center, contour):
-                                    in_zone = True
-                                    matched_zone_id = zone_obj.id
-                                    z_check = zone_engine.evaluate_zone_rule(
-                                        zone_type=zone_obj.zone_type,
-                                        matched_user=best_match_user,
-                                        is_recognized=is_rec,
-                                        face_detected=True,
-                                        zone_name=zone_obj.name,
-                                    )
-                                    color = z_check.color_bgr
-                                    label = z_check.message
-                                    if z_check.is_violation:
-                                        last_breached_zones.add(zone_obj.id)
-                                    break
-
-                            last_annotations.append((bbox, label, color))
-
-                            # Prepare spatial event for heatmap logging
-                            ws_events_to_log.append({
-                                "camera_id": camera_id,
-                                "user_id": best_match_user["id"] if is_rec else None,
-                                "user_name": best_match_user["name"] if is_rec else None,
-                                "norm_x": round(float(face_center[0]) / fw, 4),
-                                "norm_y": round(float(face_center[1]) / fh, 4),
-                                "confidence": round(float(highest_score if is_rec else 0.5), 2),
-                                "is_recognized": is_rec,
-                                "zone_id": matched_zone_id,
-                            })
-
-                        # Sample detection event logging every 10 frames (~3x per sec)
-                        if frame_count % 10 == 0 and ws_events_to_log:
-                            asyncio.create_task(_persist_detection_events(ws_events_to_log))
+                    # Sample detection event logging every 10 frames (~3x per sec)
+                    if frame_count % 10 == 0 and ws_events_to_log:
+                        asyncio.create_task(_persist_detection_events(ws_events_to_log))
 
                     if zones_with_contours:
                         frame = zone_engine.render_zones_on_frame(
@@ -645,10 +603,10 @@ class CameraService:
             cap.release()
 
     async def get_snapshot(
-        self,
-        camera_id: int,
-        annotate_faces: bool = True,
-        match_threshold: float = MATCH_THRESHOLD,
+            self,
+            camera_id: int,
+            annotate_faces: bool = True,
+            match_threshold: float = MATCH_THRESHOLD,
     ) -> bytes:
         """Captures a single annotated JPEG frame from the camera with zone policies."""
         camera = await self.repository.get_by_id(camera_id)
@@ -744,7 +702,8 @@ class CameraService:
                     cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), color, 2)
                     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
                     cv2.rectangle(frame, (bx, max(0, by - 22)), (bx + tw + 8, max(22, by)), color, -1)
-                    cv2.putText(frame, label, (bx + 4, max(16, by - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.putText(frame, label, (bx + 4, max(16, by - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                                (255, 255, 255), 1, cv2.LINE_AA)
 
             if zones_with_contours:
                 frame = zone_engine.render_zones_on_frame(frame, zones_with_contours, breached_zones)

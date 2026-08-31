@@ -1,20 +1,22 @@
 import asyncio
-from datetime import datetime, timezone
-from functools import partial
 import json
 import os
-from pathlib import Path
 import uuid
+from datetime import datetime, timezone
+from functools import partial
+from pathlib import Path
+
 import aiofiles
 import cv2
-from fastapi import HTTPException, UploadFile, status
 import numpy as np
+from fastapi import HTTPException, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.repositories.user_repository import UserRepository
 from app.repositories.zone_repository import ZoneRepository
 from app.schemas.video import VideoProcessResponse
 from app.services.face_recognition_service import face_recognition_service
+from app.services.tracking_service import FaceTrackerManager
 from app.services.zone_service import zone_engine
 
 MATCH_THRESHOLD = 0.38
@@ -91,12 +93,12 @@ class VideoProcessingService:
                 pass
 
     async def annotate_video_file(
-        self,
-        video_file: UploadFile,
-        sample_rate: int = 1,
-        match_threshold: float = MATCH_THRESHOLD,
-        camera_id: int | None = None,
-        zones_data: list[dict] | None = None,
+            self,
+            video_file: UploadFile,
+            sample_rate: int = 1,
+            match_threshold: float = MATCH_THRESHOLD,
+            camera_id: int | None = None,
+            zones_data: list[dict] | None = None,
     ) -> dict:
         """Non-blocking video annotation with AdaFace and Zone detection policies."""
         video_id = str(uuid.uuid4())
@@ -200,13 +202,13 @@ class VideoProcessingService:
         }
 
     def _process_video_sync(
-        self,
-        input_path: str,
-        output_path: str,
-        known_users: list[dict],
-        match_threshold: float,
-        sample_rate: int = 1,
-        zones_data: list[dict] | None = None,
+            self,
+            input_path: str,
+            output_path: str,
+            known_users: list[dict],
+            match_threshold: float,
+            sample_rate: int = 1,
+            zones_data: list[dict] | None = None,
     ) -> tuple[int, float, int, set[str], float]:
         """Synchronous, thread-isolated worker function executing in worker pool."""
         cap = cv2.VideoCapture(input_path)
@@ -238,6 +240,10 @@ class VideoProcessingService:
                     zones_with_contours.append((z, contour))
 
         detector = self.recognition_service.get_detector((width, height))
+        tracker_manager = FaceTrackerManager(
+            fps=int(fps),
+            recheck_interval_frames=max(15, int(fps * 2)),
+        )
 
         fourcc = cv2.VideoWriter_fourcc(*"avc1")
         writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
@@ -250,7 +256,7 @@ class VideoProcessingService:
             raise RuntimeError("Failed to initialize video writer with avc1 or mp4v codec.")
 
         total_frames = 0
-        total_detections = 0
+        unique_track_ids = set()
         recognized_users = set()
         last_annotations = []
         last_breached_zones = set()
@@ -268,67 +274,48 @@ class VideoProcessingService:
                     last_annotations = []
                     last_breached_zones = set()
                     detector.setInputSize((fw, fh))
-                    _, faces = detector.detect(frame)
+                    _, raw_faces = detector.detect(frame)
 
-                    if faces is not None and len(faces) > 0:
-                        total_detections += len(faces)
-                        bboxes = [f[:4].astype(int) for f in faces]
-                        crops = [
-                            self.recognition_service.align_and_crop(frame, f)
-                            for f in faces
-                        ]
-                        embeddings = self.recognition_service.extract_batch_embeddings(crops)
+                    tracked_faces = tracker_manager.update(
+                        frame=frame,
+                        raw_faces=raw_faces,
+                        recognition_service=self.recognition_service,
+                        enrolled_matrix=enrolled_matrix,
+                        known_users=known_users,
+                        match_threshold=match_threshold,
+                    )
 
-                        for bbox, emb in zip(bboxes, embeddings):
-                            bx, by, bw, bh = bbox
-                            face_center = (bx + bw // 2, by + bh // 2)
+                    for tf in tracked_faces:
+                        unique_track_ids.add(tf.track_id)
+                        if tf.is_recognized:
+                            recognized_users.add(tf.name)
 
-                            best_match_user = None
-                            highest_score = -1.0
+                        bx, by, bw, bh = tf.bbox_xywh
+                        face_center = (bx + bw // 2, by + bh // 2)
 
-                            if enrolled_matrix is not None and len(known_users) > 0:
-                                sims = self.recognition_service.batch_cosine_similarity(
-                                    emb, enrolled_matrix
+                        label = f"ID:{tf.track_id} | {tf.name} ({tf.confidence:.2f})"
+                        color = tf.color_bgr
+
+                        for zone_obj, contour in zones_with_contours:
+                            if zone_engine.is_point_in_zone(face_center, contour):
+                                z_type = zone_obj.get("zone_type", "registered")
+                                z_name = zone_obj.get("name", "Zone")
+                                z_check = zone_engine.evaluate_zone_rule(
+                                    zone_type=z_type,
+                                    matched_user=tf.user_data,
+                                    is_recognized=tf.is_recognized,
+                                    face_detected=True,
+                                    zone_name=z_name,
                                 )
-                                best_idx = int(np.argmax(sims))
-                                highest_score = float(sims[best_idx])
-                                best_match_user = known_users[best_idx]
+                                color = z_check.color_bgr
+                                label = f"ID:{tf.track_id} | {z_check.message}"
+                                if z_check.is_violation:
+                                    z_id = zone_obj.get("id")
+                                    if z_id:
+                                        last_breached_zones.add(z_id)
+                                break
 
-                            is_rec = (
-                                highest_score >= match_threshold
-                                and best_match_user is not None
-                            )
-
-                            if is_rec:
-                                recognized_users.add(best_match_user["name"])
-
-                            label = (
-                                f"{best_match_user['name']} ({highest_score:.2f})"
-                                if is_rec
-                                else f"Unknown ({highest_score:.2f})"
-                            )
-                            color = (0, 255, 0) if is_rec else (0, 0, 255)
-
-                            for zone_obj, contour in zones_with_contours:
-                                if zone_engine.is_point_in_zone(face_center, contour):
-                                    z_type = zone_obj.get("zone_type", "registered")
-                                    z_name = zone_obj.get("name", "Zone")
-                                    z_check = zone_engine.evaluate_zone_rule(
-                                        zone_type=z_type,
-                                        matched_user=best_match_user,
-                                        is_recognized=is_rec,
-                                        face_detected=True,
-                                        zone_name=z_name,
-                                    )
-                                    color = z_check.color_bgr
-                                    label = z_check.message
-                                    if z_check.is_violation:
-                                        z_id = zone_obj.get("id")
-                                        if z_id:
-                                            last_breached_zones.add(z_id)
-                                    break
-
-                            last_annotations.append((bbox, label, color))
+                        last_annotations.append((tf.bbox_xywh, label, color))
 
                 # Render zones
                 if zones_with_contours:
@@ -370,4 +357,5 @@ class VideoProcessingService:
             writer.release()
 
         actual_duration = (total_frames / fps) if fps > 0 else duration
-        return total_frames, fps, total_detections, recognized_users, actual_duration
+        total_unique_visitors = len(unique_track_ids)
+        return total_frames, fps, total_unique_visitors, recognized_users, actual_duration
