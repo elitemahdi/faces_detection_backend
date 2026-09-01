@@ -7,6 +7,7 @@ from fastapi import HTTPException, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import AsyncSessionLocal
+from app.core.frame_cache import frame_cache
 from app.repositories.camera_repository import CameraRepository
 from app.repositories.detection_event_repository import DetectionEventRepository
 from app.repositories.user_repository import UserRepository
@@ -232,9 +233,12 @@ class CameraService:
             fail_count = 0
             last_annotations = []
             last_breached_zones = set()
+            cached_resolution = None
+            zones_with_contours = []
+            background_tasks: set[asyncio.Task] = set()
 
             while cap.isOpened():
-                ret, frame = cap.read()
+                ret, frame = await asyncio.to_thread(cap.read)
                 if not ret:
                     fail_count += 1
                     if fail_count > 30:
@@ -243,16 +247,18 @@ class CameraService:
                     continue
 
                 fail_count = 0
-                self.set_cached_frame(camera_id, frame)
+                frame_cache.set(camera_id, frame)
 
                 frame_count += 1
                 fh, fw, _ = frame.shape
 
-                # Prepare denormalized zone contours for current resolution
-                zones_with_contours = [
-                    (z, zone_engine.denormalize_points(z.coordinates, fw, fh))
-                    for z in active_zones
-                ]
+                # Cache denormalized zone contours and only recompute when resolution changes
+                if cached_resolution != (fw, fh):
+                    zones_with_contours = [
+                        (z, zone_engine.denormalize_points(z.coordinates, fw, fh))
+                        for z in active_zones
+                    ]
+                    cached_resolution = (fw, fh)
 
                 if annotate_faces:
                     last_annotations = []
@@ -310,9 +316,11 @@ class CameraService:
                             "zone_id": matched_zone_id,
                         })
 
-                    # Sample detection event logging every 10 frames (~3x per sec)
+                    # Sample detection event logging every 10 frames (~3x per sec) with task GC protection
                     if frame_count % 10 == 0 and events_to_log:
-                        asyncio.create_task(_persist_detection_events(events_to_log))
+                        persist_task = asyncio.create_task(_persist_detection_events(events_to_log))
+                        background_tasks.add(persist_task)
+                        persist_task.add_done_callback(background_tasks.discard)
 
                     # 1. Render semi-transparent zone polygons onto frame
                     if zones_with_contours:
@@ -369,7 +377,7 @@ class CameraService:
                 await asyncio.sleep(0.033)
 
         finally:
-            self._latest_raw_frames.pop(camera_id, None)
+            frame_cache.remove(camera_id)
             cap.release()
 
     async def stream_camera_websocket(
@@ -468,9 +476,12 @@ class CameraService:
             fail_count = 0
             last_annotations = []
             last_breached_zones = set()
+            cached_resolution = None
+            zones_with_contours = []
+            background_tasks: set[asyncio.Task] = set()
 
             while cap.isOpened():
-                ret, frame = cap.read()
+                ret, frame = await asyncio.to_thread(cap.read)
                 if not ret:
                     fail_count += 1
                     if fail_count > 30:
@@ -479,15 +490,18 @@ class CameraService:
                     continue
 
                 fail_count = 0
-                self.set_cached_frame(camera_id, frame)
+                frame_cache.set(camera_id, frame)
 
                 frame_count += 1
                 fh, fw, _ = frame.shape
 
-                zones_with_contours = [
-                    (z, zone_engine.denormalize_points(z.coordinates, fw, fh))
-                    for z in active_zones
-                ]
+                # Cache denormalized zone contours and only recompute when resolution changes
+                if cached_resolution != (fw, fh):
+                    zones_with_contours = [
+                        (z, zone_engine.denormalize_points(z.coordinates, fw, fh))
+                        for z in active_zones
+                    ]
+                    cached_resolution = (fw, fh)
 
                 if current_annotate:
                     last_annotations = []
@@ -545,9 +559,11 @@ class CameraService:
                             "zone_id": matched_zone_id,
                         })
 
-                    # Sample detection event logging every 10 frames (~3x per sec)
+                    # Sample detection event logging every 10 frames (~3x per sec) with task GC protection
                     if frame_count % 10 == 0 and ws_events_to_log:
-                        asyncio.create_task(_persist_detection_events(ws_events_to_log))
+                        ws_persist_task = asyncio.create_task(_persist_detection_events(ws_events_to_log))
+                        background_tasks.add(ws_persist_task)
+                        ws_persist_task.add_done_callback(background_tasks.discard)
 
                     if zones_with_contours:
                         frame = zone_engine.render_zones_on_frame(
@@ -598,7 +614,7 @@ class CameraService:
         except Exception:
             pass
         finally:
-            self._latest_raw_frames.pop(camera_id, None)
+            frame_cache.remove(camera_id)
             recv_task.cancel()
             cap.release()
 
@@ -617,15 +633,15 @@ class CameraService:
             )
 
         device_src = int(camera.source) if camera.source.isdigit() else camera.source
-        cap = cv2.VideoCapture(device_src)
+        cap = await asyncio.to_thread(cv2.VideoCapture, device_src)
         if not cap.isOpened():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Unable to connect to camera source '{camera.source}'.",
             )
 
-        ret, frame = cap.read()
-        cap.release()
+        ret, frame = await asyncio.to_thread(cap.read)
+        await asyncio.to_thread(cap.release)
 
         if not ret or frame is None:
             raise HTTPException(

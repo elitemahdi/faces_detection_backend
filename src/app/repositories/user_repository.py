@@ -1,4 +1,3 @@
-from collections.abc import Sequence
 from datetime import datetime, timezone
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,10 +19,19 @@ class UserRepository:
         return result.scalar_one_or_none()
 
     async def get_by_email_or_phone(
-        self, email: str, phone: str, exclude_user_id: int | None = None
+        self, email: str | None = None, phone: str | None = None, exclude_user_id: int | None = None
     ) -> User | None:
+        conditions = []
+        if email:
+            conditions.append(User.email == email)
+        if phone:
+            conditions.append(User.phone == phone)
+
+        if not conditions:
+            return None
+
         query = select(User).where(
-            or_(User.email == email, User.phone == phone),
+            or_(*conditions),
             User.deleted_at.is_(None),
         )
         if exclude_user_id is not None:
@@ -33,10 +41,10 @@ class UserRepository:
         return result.scalar_one_or_none()
 
     async def create(
-            self,
-            user_in: UserCreate,
-            photo_path: str,
-            embedding: list[float] | None = None,
+        self,
+        user_in: UserCreate,
+        photo_path: str,
+        embedding: list[float] | None = None,
     ) -> User:
         db_user = User(
             full_name=user_in.full_name,
@@ -71,16 +79,18 @@ class UserRepository:
         return user
 
     async def soft_delete(self, user: User) -> None:
-        """Sets deleted_at timestamp instead of permanently removing row."""
+        """Sets deleted_at timestamp and refreshes the in-memory entity."""
         user.deleted_at = datetime.now(timezone.utc)
         await self.session.commit()
+        await self.session.refresh(user)
 
-    async def list_all(self, skip: int = 0, limit: int = 20) -> Sequence[User]:
+    async def list_all(self, skip: int = 0, limit: int = 20) -> list[User]:
         query = (
             select(User)
             .where(User.deleted_at.is_(None))
+            .order_by(User.id.desc())
             .offset(skip)
             .limit(limit)
         )
         result = await self.session.execute(query)
-        return result.scalars().all()
+        return list(result.scalars().all())

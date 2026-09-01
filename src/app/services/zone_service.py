@@ -43,7 +43,13 @@ class ZoneEngine:
     ) -> np.ndarray:
         """Converts normalized [[x, y], ...] coordinates (0.0 to 1.0) into integer pixel coordinates."""
         pts = np.array(
-            [[int(pt[0] * width), int(pt[1] * height)] for pt in norm_coords],
+            [
+                [
+                    int(np.clip(pt[0], 0.0, 1.0) * width),
+                    int(np.clip(pt[1], 0.0, 1.0) * height),
+                ]
+                for pt in norm_coords
+            ],
             dtype=np.int32,
         )
         return pts.reshape((-1, 1, 2))
@@ -64,7 +70,13 @@ class ZoneEngine:
         zone_name: str = "Zone",
     ) -> ZoneRuleCheckResult:
         """Evaluates access policy rules for a detected person inside a designated zone."""
-        z_type = ZoneType(zone_type) if isinstance(zone_type, str) else zone_type
+        if isinstance(zone_type, str):
+            try:
+                z_type = ZoneType(zone_type.lower())
+            except ValueError:
+                z_type = ZoneType.REGISTERED
+        else:
+            z_type = zone_type
 
         # 1. BANNED ZONE: Absolute zero tolerance. No one is permitted to enter.
         if z_type == ZoneType.BANNED:
@@ -179,7 +191,7 @@ class ZoneEngine:
         zones_with_contours: list[tuple[Any, np.ndarray]],
         active_violation_zone_ids: set[int] | None = None,
     ) -> np.ndarray:
-        """Renders semi-transparent filled polygons (25% alpha), solid borders, and zone tags on frame."""
+        """Renders semi-transparent filled polygons (25% alpha), crisp solid borders, and sharp zone tags."""
         if not zones_with_contours:
             return frame
 
@@ -187,22 +199,45 @@ class ZoneEngine:
         overlay = frame.copy()
         violation_ids = active_violation_zone_ids or set()
 
+        # Step 1: Draw filled polygons ONLY on the overlay
         for zone_obj, contour in zones_with_contours:
             z_id = getattr(zone_obj, "id", None) or (zone_obj.get("id") if isinstance(zone_obj, dict) else None)
             z_type_raw = getattr(zone_obj, "zone_type", None) or (zone_obj.get("zone_type") if isinstance(zone_obj, dict) else "registered")
-            z_type = ZoneType(z_type_raw) if isinstance(z_type_raw, str) else z_type_raw
+            if isinstance(z_type_raw, str):
+                try:
+                    z_type = ZoneType(z_type_raw.lower())
+                except ValueError:
+                    z_type = ZoneType.REGISTERED
+            else:
+                z_type = z_type_raw
+
+            is_breached = z_id in violation_ids
+            base_color = (0, 0, 255) if is_breached else cls.ZONE_COLORS.get(z_type, (200, 200, 200))
+            cv2.fillPoly(overlay, [contour], base_color)
+
+        # Step 2: Apply 25% transparent blend
+        cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
+
+        # Step 3: Draw sharp, 100% opaque borders and text on the blended frame
+        for zone_obj, contour in zones_with_contours:
+            z_id = getattr(zone_obj, "id", None) or (zone_obj.get("id") if isinstance(zone_obj, dict) else None)
+            z_type_raw = getattr(zone_obj, "zone_type", None) or (zone_obj.get("zone_type") if isinstance(zone_obj, dict) else "registered")
+            if isinstance(z_type_raw, str):
+                try:
+                    z_type = ZoneType(z_type_raw.lower())
+                except ValueError:
+                    z_type = ZoneType.REGISTERED
+            else:
+                z_type = z_type_raw
             z_name = getattr(zone_obj, "name", None) or (zone_obj.get("name") if isinstance(zone_obj, dict) else "Zone")
 
             is_breached = z_id in violation_ids
             base_color = (0, 0, 255) if is_breached else cls.ZONE_COLORS.get(z_type, (200, 200, 200))
 
-            # 1. Fill semi-transparent polygon
-            cv2.fillPoly(overlay, [contour], base_color)
-
-            # 2. Solid outline border
+            # Sharp outline border
             cv2.polylines(frame, [contour], isClosed=True, color=base_color, thickness=2, lineType=cv2.LINE_AA)
 
-            # 3. Zone Centroid Tag Label
+            # Zone Centroid Tag Label
             M = cv2.moments(contour)
             if M["m00"] != 0:
                 cx = int(M["m10"] / M["m00"])
@@ -220,7 +255,7 @@ class ZoneEngine:
             tx = max(4, min(fw - tw - 12, cx - tw // 2))
             ty = max(20, min(fh - 10, cy))
 
-            # Draw tag badge background & text
+            # Draw crisp opaque tag badge background & text
             cv2.rectangle(
                 frame,
                 (tx - 4, ty - th - 6),
@@ -239,8 +274,6 @@ class ZoneEngine:
                 cv2.LINE_AA,
             )
 
-        # Apply 25% alpha blending for zone fills
-        cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
         return frame
 
 

@@ -108,17 +108,22 @@ class FaceRecognitionService:
         if self.sface_recognizer is not None:
             return self.sface_recognizer.alignCrop(img, face_info)
 
-        # Fallback bounding box crop & resize
+        # Fallback bounding box crop & resize with safe boundary clipping
         x, y, w, h = face_info[:4].astype(int)
         ih, iw, _ = img.shape
-        x, y = max(0, x), max(0, y)
-        w, h = min(w, iw - x), min(h, ih - y)
-        crop = img[y : y + h, x : x + w]
+        x1 = int(np.clip(x, 0, iw - 1))
+        y1 = int(np.clip(y, 0, ih - 1))
+        x2 = int(np.clip(x + w, x1 + 1, iw))
+        y2 = int(np.clip(y + h, y1 + 1, ih))
+        crop = img[y1:y2, x1:x2]
         return cv2.resize(crop, (112, 112)) if crop.size > 0 else np.zeros((112, 112, 3), dtype=np.uint8)
 
     def extract_embedding(self, aligned_bgr_112: np.ndarray) -> list[float]:
-        """Extracts a single 512-dim L2-normalized embedding."""
-        return self.extract_batch_embeddings([aligned_bgr_112])[0]
+        """Extracts a single 512-dim L2-normalized embedding with empty output guard."""
+        embeddings = self.extract_batch_embeddings([aligned_bgr_112])
+        if not embeddings:
+            raise RuntimeError("Failed to extract face embedding.")
+        return embeddings[0]
 
     def extract_batch_embeddings(self, aligned_crops: list[np.ndarray]) -> list[list[float]]:
         """Extracts 512-dim L2-normalized feature embeddings from a batch of 112x112 aligned face crops.
@@ -212,11 +217,15 @@ class FaceRecognitionService:
         enrolled_matrix: np.ndarray,
     ) -> np.ndarray:
         """Vectorized cosine similarity search across an entire matrix of enrolled embeddings (Q . E^T)."""
-        q = np.array(query_vec, dtype=np.float32)
+        if enrolled_matrix is None or enrolled_matrix.size == 0:
+            return np.empty((0,), dtype=np.float32)
+
+        mat = np.atleast_2d(enrolled_matrix).astype(np.float32)
+        q = np.array(query_vec, dtype=np.float32).flatten()
         qn = np.linalg.norm(q)
         if qn > 1e-6:
             q = q / qn
-        return np.dot(enrolled_matrix, q)
+        return np.dot(mat, q)
 
 
 # Global singleton instance (stateless & thread-safe)

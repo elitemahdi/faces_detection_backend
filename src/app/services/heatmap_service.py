@@ -1,3 +1,4 @@
+import asyncio
 from collections import Counter
 from datetime import datetime, timezone
 import cv2
@@ -5,6 +6,7 @@ from fastapi import HTTPException, status
 import numpy as np
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.frame_cache import frame_cache
 from app.models.detection_event import DetectionEvent
 from app.repositories.camera_repository import CameraRepository
 from app.repositories.detection_event_repository import DetectionEventRepository
@@ -18,6 +20,22 @@ from app.schemas.heatmap import (
     ZoneRankingItem,
 )
 from app.services.zone_service import zone_engine
+
+
+
+def _capture_fallback_frame(source: str, w: int, h: int) -> np.ndarray | None:
+    """Synchronous fallback worker for capturing a single background frame without blocking event loop."""
+    try:
+        device_src = int(source) if source.isdigit() else source
+        cap = cv2.VideoCapture(device_src)
+        if cap.isOpened():
+            ret, frame = cap.read()
+            cap.release()
+            if ret and frame is not None:
+                return cv2.resize(frame, (w, h))
+    except Exception:
+        pass
+    return None
 
 
 class HeatmapService:
@@ -228,23 +246,13 @@ class HeatmapService:
             limit=10000,
         )
 
-        # 1. Base Frame: Check in-memory stream cache first
+        # 1. Base Frame: Check decoupled frame_cache first, fallback non-blockingly via asyncio.to_thread
         base_frame = None
-        from app.services.camera_service import CameraService
-        cached_frame = CameraService.get_cached_frame(camera_id)
+        cached_frame = frame_cache.get(camera_id)
         if cached_frame is not None:
             base_frame = cv2.resize(cached_frame, (width, height))
         else:
-            try:
-                device_src = int(camera.source) if camera.source.isdigit() else camera.source
-                cap = cv2.VideoCapture(device_src)
-                if cap.isOpened():
-                    ret, frame = cap.read()
-                    if ret and frame is not None:
-                        base_frame = cv2.resize(frame, (width, height))
-                cap.release()
-            except Exception:
-                pass
+            base_frame = await asyncio.to_thread(_capture_fallback_frame, camera.source, width, height)
 
         if base_frame is None:
             base_frame = np.full((height, width, 3), 20, dtype=np.uint8)
@@ -253,7 +261,7 @@ class HeatmapService:
             for y in range(0, height, 60):
                 cv2.line(base_frame, (0, y), (width, y), (35, 35, 35), 1)
 
-        # 2. Accumulate spatial heat density
+        # 2. Accumulate spatial heat density additively
         density_map = np.zeros((height, width), dtype=np.float32)
 
         if events:
@@ -261,10 +269,13 @@ class HeatmapService:
                 px = int(np.clip(e.norm_x * width, 0, width - 1))
                 py = int(np.clip(e.norm_y * height, 0, height - 1))
                 weight = float(np.clip(e.confidence, 0.2, 1.5))
-                cv2.circle(density_map, (px, py), radius, weight, -1)
+                density_map[py, px] += weight
 
-            ksize = radius * 2 + 1
-            density_map = cv2.GaussianBlur(density_map, (ksize, ksize), 0)
+            ksize = int(radius * 4 + 1)
+            if ksize % 2 == 0:
+                ksize += 1
+            sigma = float(radius / 2.0)
+            density_map = cv2.GaussianBlur(density_map, (ksize, ksize), sigma)
 
             max_val = np.max(density_map)
             if max_val > 0:

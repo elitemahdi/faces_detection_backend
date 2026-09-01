@@ -16,7 +16,7 @@ class ZoneRepository:
             Zone.id == zone_id, Zone.deleted_at.is_(None)
         )
         result = await self.session.execute(query)
-        return result.scalars().first()
+        return result.scalar_one_or_none()
 
     async def list_by_camera(
         self, camera_id: int, active_only: bool = False
@@ -26,6 +26,7 @@ class ZoneRepository:
         )
         if active_only:
             query = query.where(Zone.is_active.is_(True))
+        query = query.order_by(Zone.id.asc())
         result = await self.session.execute(query)
         return list(result.scalars().all())
 
@@ -35,18 +36,14 @@ class ZoneRepository:
         query = select(Zone).where(Zone.deleted_at.is_(None))
         if active_only:
             query = query.where(Zone.is_active.is_(True))
-        query = query.offset(skip).limit(limit)
+        query = query.order_by(Zone.id.desc()).offset(skip).limit(limit)
         result = await self.session.execute(query)
         return list(result.scalars().all())
 
     async def create(self, camera_id: int, zone_in: ZoneCreate) -> Zone:
-        db_zone = Zone(
-            camera_id=camera_id,
-            name=zone_in.name,
-            zone_type=zone_in.zone_type,
-            coordinates=zone_in.coordinates,
-            is_active=zone_in.is_active,
-        )
+        data = zone_in.model_dump()
+        data["camera_id"] = camera_id
+        db_zone = Zone(**data)
         self.session.add(db_zone)
         await self.session.commit()
         await self.session.refresh(db_zone)
@@ -64,3 +61,4 @@ class ZoneRepository:
         zone.deleted_at = datetime.now(timezone.utc)
         zone.is_active = False
         await self.session.commit()
+        await self.session.refresh(zone)

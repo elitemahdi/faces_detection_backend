@@ -1,3 +1,4 @@
+import threading
 import asyncio
 import json
 import os
@@ -27,6 +28,7 @@ STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class VideoProcessingService:
+    _meta_lock = threading.Lock()
 
     def __init__(self, session: AsyncSession):
         self.session = session
@@ -35,20 +37,22 @@ class VideoProcessingService:
         self.recognition_service = face_recognition_service
 
     def _read_metadata(self) -> dict[str, dict]:
-        if not METADATA_FILE.exists():
-            return {}
-        try:
-            with open(METADATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        with self._meta_lock:
+            if not METADATA_FILE.exists():
+                return {}
+            try:
+                with open(METADATA_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
 
     def _save_metadata(self, data: dict[str, dict]) -> None:
-        try:
-            with open(METADATA_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, default=str)
-        except Exception:
-            pass
+        with self._meta_lock:
+            try:
+                with open(METADATA_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, default=str)
+            except Exception:
+                pass
 
     def list_processed_videos(self) -> list[VideoProcessResponse]:
         meta = self._read_metadata()
@@ -271,51 +275,54 @@ class VideoProcessingService:
                 fh, fw, _ = frame.shape
 
                 if total_frames % sample_rate == 0:
-                    last_annotations = []
-                    last_breached_zones = set()
                     detector.setInputSize((fw, fh))
                     _, raw_faces = detector.detect(frame)
+                else:
+                    raw_faces = None  # Advances Kalman filter without running detector
 
-                    tracked_faces = tracker_manager.update(
-                        frame=frame,
-                        raw_faces=raw_faces,
-                        recognition_service=self.recognition_service,
-                        enrolled_matrix=enrolled_matrix,
-                        known_users=known_users,
-                        match_threshold=match_threshold,
-                    )
+                last_annotations = []
+                last_breached_zones = set()
 
-                    for tf in tracked_faces:
-                        unique_track_ids.add(tf.track_id)
-                        if tf.is_recognized:
-                            recognized_users.add(tf.name)
+                tracked_faces = tracker_manager.update(
+                    frame=frame,
+                    raw_faces=raw_faces,
+                    recognition_service=self.recognition_service,
+                    enrolled_matrix=enrolled_matrix,
+                    known_users=known_users,
+                    match_threshold=match_threshold,
+                )
 
-                        bx, by, bw, bh = tf.bbox_xywh
-                        face_center = (bx + bw // 2, by + bh // 2)
+                for tf in tracked_faces:
+                    unique_track_ids.add(tf.track_id)
+                    if tf.is_recognized:
+                        recognized_users.add(tf.name)
 
-                        label = f"ID:{tf.track_id} | {tf.name} ({tf.confidence:.2f})"
-                        color = tf.color_bgr
+                    bx, by, bw, bh = tf.bbox_xywh
+                    face_center = (bx + bw // 2, by + bh // 2)
 
-                        for zone_obj, contour in zones_with_contours:
-                            if zone_engine.is_point_in_zone(face_center, contour):
-                                z_type = zone_obj.get("zone_type", "registered")
-                                z_name = zone_obj.get("name", "Zone")
-                                z_check = zone_engine.evaluate_zone_rule(
-                                    zone_type=z_type,
-                                    matched_user=tf.user_data,
-                                    is_recognized=tf.is_recognized,
-                                    face_detected=True,
-                                    zone_name=z_name,
-                                )
-                                color = z_check.color_bgr
-                                label = f"ID:{tf.track_id} | {z_check.message}"
-                                if z_check.is_violation:
-                                    z_id = zone_obj.get("id")
-                                    if z_id:
-                                        last_breached_zones.add(z_id)
-                                break
+                    label = f"ID:{tf.track_id} | {tf.name} ({tf.confidence:.2f})"
+                    color = tf.color_bgr
 
-                        last_annotations.append((tf.bbox_xywh, label, color))
+                    for zone_obj, contour in zones_with_contours:
+                        if zone_engine.is_point_in_zone(face_center, contour):
+                            z_type = zone_obj.get("zone_type", "registered")
+                            z_name = zone_obj.get("name", "Zone")
+                            z_check = zone_engine.evaluate_zone_rule(
+                                zone_type=z_type,
+                                matched_user=tf.user_data,
+                                is_recognized=tf.is_recognized,
+                                face_detected=True,
+                                zone_name=z_name,
+                            )
+                            color = z_check.color_bgr
+                            label = f"ID:{tf.track_id} | {z_check.message}"
+                            if z_check.is_violation:
+                                z_id = zone_obj.get("id")
+                                if z_id is not None:
+                                    last_breached_zones.add(z_id)
+                            break
+
+                    last_annotations.append((tf.bbox_xywh, label, color))
 
                 # Render zones
                 if zones_with_contours:
