@@ -2,12 +2,15 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-YUNET_MODEL_PATH = Path("models/face_detection_yunet.onnx")
-SFACE_MODEL_PATH = Path("models/face_recognition_sface.onnx")
-ADAFACE_MODEL_PATH = Path("models/adaface_ir50.onnx")
+from app.core.config import settings
+from app.services.detector_service import YoloFaceDetector, YuNetFaceDetector
 
-# Standard InsightFace / AdaFace 5-point landmark coordinates for 112x112 aligned crops
-# Coordinate-for-coordinate match with YuNet:
+YOLO_MODEL_PATH = Path(settings.YOLO_MODEL_PATH)
+YUNET_MODEL_PATH = Path(settings.YUNET_MODEL_PATH)
+SFACE_MODEL_PATH = Path(settings.SFACE_MODEL_PATH)
+ADAFACE_MODEL_PATH = Path(settings.ADAFACE_MODEL_PATH)
+
+# Standard InsightFace / AdaFace 5-point landmark coordinates for 112x112 aligned crops:
 # 1. Right Eye: [38.2946, 51.6963]
 # 2. Left Eye:  [73.5318, 51.5014]
 # 3. Nose Tip:  [56.0252, 71.7366]
@@ -26,17 +29,15 @@ REFERENCE_5_POINTS = np.array(
 
 
 class FaceRecognitionService:
-    """Thread-safe Face Recognition Service.
-    - Shares read-only thread-safe ONNX Runtime session for AdaFace across all threads.
-    - Provides dedicated per-thread OpenCV FaceDetectorYN instances via get_detector().
-    - Implements batched tensor inference, quality gating, and vectorized cosine similarity.
+    """Thread-safe Multi-Model Face Detection & Recognition Service.
+    - Supports YOLOv8-Face / YOLOv11-Face for high-recall CCTV surveillance + YuNet fallback.
+    - Quality-adaptive AdaFace IR-50 feature extraction with SFace / MobileFaceNet CPU fallback.
+    - 5-point affine alignment, batch matrix vector search, and distance gating.
     """
 
     def __init__(self):
-        if not YUNET_MODEL_PATH.exists():
-            raise RuntimeError(f"Face detector model not found at {YUNET_MODEL_PATH}.")
-
-        self.yunet_path = str(YUNET_MODEL_PATH)
+        self.yunet_path = YUNET_MODEL_PATH
+        self.yolo_path = YOLO_MODEL_PATH
         self.adaface_session = None
         self.input_name = None
         self._load_adaface_model()
@@ -70,16 +71,29 @@ class FaceRecognitionService:
         except Exception:
             self.adaface_session = None
 
-    def get_detector(self, initial_size: tuple[int, int] = (320, 320)) -> cv2.FaceDetectorYN:
-        """Instantiates a dedicated, thread-safe FaceDetectorYN instance for the calling thread."""
-        return cv2.FaceDetectorYN.create(
-            model=self.yunet_path,
-            config="",
-            input_size=initial_size,
-            score_threshold=0.6,
-            nms_threshold=0.3,
-            top_k=5000,
-        )
+    def get_detector(self, initial_size: tuple[int, int] = (640, 640)):
+        """Returns the optimal face detector instance.
+        If YOLOv8-Face is available and enabled in settings, uses YoloFaceDetector for maximum surveillance recall.
+        Otherwise falls back to OpenCV YuNetFaceDetector.
+        """
+        use_yolo = settings.DETECTOR_BACKBONE in ("yolo", "auto")
+        if use_yolo and self.yolo_path.exists():
+            return YoloFaceDetector(
+                model_path=self.yolo_path,
+                input_size=(640, 640),
+                score_threshold=0.35,
+                nms_threshold=0.45,
+            )
+
+        if self.yunet_path.exists():
+            return YuNetFaceDetector(
+                model_path=self.yunet_path,
+                initial_size=initial_size,
+                score_threshold=0.55,
+                nms_threshold=0.30,
+            )
+
+        raise RuntimeError("No face detector model (YOLO-Face or YuNet) found in models/.")
 
     def align_and_crop(self, img: np.ndarray, face_info: np.ndarray) -> np.ndarray:
         """Aligns and crops the face to 112x112 using OpenCV similarity affine transform."""
@@ -104,11 +118,9 @@ class FaceRecognitionService:
                 borderValue=(0, 0, 0),
             )
 
-        # Fallback using FaceRecognizerSF alignCrop if available
         if self.sface_recognizer is not None:
             return self.sface_recognizer.alignCrop(img, face_info)
 
-        # Fallback bounding box crop & resize with safe boundary clipping
         x, y, w, h = face_info[:4].astype(int)
         ih, iw, _ = img.shape
         x1 = int(np.clip(x, 0, iw - 1))
@@ -126,11 +138,7 @@ class FaceRecognitionService:
         return embeddings[0]
 
     def extract_batch_embeddings(self, aligned_crops: list[np.ndarray]) -> list[list[float]]:
-        """Extracts 512-dim L2-normalized feature embeddings from a batch of 112x112 aligned face crops.
-        - Transforms HWC (112, 112, 3) to CHW (3, 112, 112) and normalizes to [-1, 1].
-        - Evaluates the batch in a single forward ONNX inference call.
-        - Normalizes embeddings across the batch dimension.
-        """
+        """Extracts 512-dim L2-normalized feature embeddings from a batch of 112x112 aligned face crops."""
         if not aligned_crops:
             return []
 
@@ -145,7 +153,6 @@ class FaceRecognitionService:
             )
             outputs = self.adaface_session.run(None, {self.input_name: batch})[0]
 
-            # Vectorized L2 normalization across batch dimension
             norms = np.linalg.norm(outputs, axis=1, keepdims=True)
             norms[norms < 1e-6] = 1.0
             normalized = outputs / norms
@@ -167,10 +174,10 @@ class FaceRecognitionService:
     def enroll_face(
         self,
         img: np.ndarray,
-        min_confidence: float = 0.90,
-        min_face_size: int = 100,
+        min_confidence: float = 0.85,
+        min_face_size: int = 80,
     ) -> tuple[np.ndarray, list[float], float]:
-        """Thread-safe Phase A Registration Quality Gate."""
+        """Registration Quality Gate for User Face Enrollment."""
         h, w, _ = img.shape
         detector = self.get_detector((w, h))
 
@@ -202,7 +209,6 @@ class FaceRecognitionService:
 
     @staticmethod
     def cosine_similarity(vec1: list[float] | np.ndarray, vec2: list[float] | np.ndarray) -> float:
-        """Calculates cosine similarity between two normalized face embeddings."""
         v1 = np.array(vec1, dtype=np.float32)
         v2 = np.array(vec2, dtype=np.float32)
         n1 = np.linalg.norm(v1)
@@ -216,7 +222,6 @@ class FaceRecognitionService:
         query_vec: list[float] | np.ndarray,
         enrolled_matrix: np.ndarray,
     ) -> np.ndarray:
-        """Vectorized cosine similarity search across an entire matrix of enrolled embeddings (Q . E^T)."""
         if enrolled_matrix is None or enrolled_matrix.size == 0:
             return np.empty((0,), dtype=np.float32)
 
@@ -228,5 +233,4 @@ class FaceRecognitionService:
         return np.dot(mat, q)
 
 
-# Global singleton instance (stateless & thread-safe)
 face_recognition_service = FaceRecognitionService()
