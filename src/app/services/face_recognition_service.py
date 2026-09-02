@@ -114,6 +114,7 @@ class FaceRecognitionService:
                 img,
                 tfm,
                 (112, 112),
+                flags=cv2.INTER_CUBIC,
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=(0, 0, 0),
             )
@@ -128,7 +129,7 @@ class FaceRecognitionService:
         x2 = int(np.clip(x + w, x1 + 1, iw))
         y2 = int(np.clip(y + h, y1 + 1, ih))
         crop = img[y1:y2, x1:x2]
-        return cv2.resize(crop, (112, 112)) if crop.size > 0 else np.zeros((112, 112, 3), dtype=np.uint8)
+        return cv2.resize(crop, (112, 112), interpolation=cv2.INTER_CUBIC) if crop.size > 0 else np.zeros((112, 112, 3), dtype=np.uint8)
 
     def extract_embedding(self, aligned_bgr_112: np.ndarray) -> list[float]:
         """Extracts a single 512-dim L2-normalized embedding with empty output guard."""
@@ -227,6 +228,9 @@ class FaceRecognitionService:
 
         mat = np.atleast_2d(enrolled_matrix).astype(np.float32)
         q = np.array(query_vec, dtype=np.float32).flatten()
+        if mat.shape[1] != q.shape[0]:
+            return np.zeros((mat.shape[0],), dtype=np.float32)
+
         qn = np.linalg.norm(q)
         if qn > 1e-6:
             q = q / qn

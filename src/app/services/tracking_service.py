@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import cv2
 import numpy as np
 import supervision as sv
 
@@ -16,30 +17,34 @@ class TrackedFace:
     user_data: dict | None = None
     landmarks: np.ndarray | None = None
     raw_detection_score: float = 1.0
+    is_fast_motion: bool = False
+    velocity: float = 0.0
 
 
 class FaceTrackerManager:
-    """Multi-Object Face Tracker (MOT) utilizing ByteTrack, Identity Caching, and Distance Gating.
+    """Robust Multi-Object Face Tracker (MOT) with Persistent Identity Lock & Long-Distance Recognition.
 
-    Surveillance Optimization:
-    - Tracks faces at any distance using ByteTrack.
-    - Applies minimum resolution threshold (min_face_size) before invoking deep AdaFace feature extraction.
-    - Prevents false biometric matches on distant, low-resolution 20px faces.
+    - Motion Gating: Strictly uses spatial velocity (px/frame) to detect fast movement without false blur rejections.
+    - Long-Distance Recognition: Enables recognition on distant faces down to 16px.
+    - Persistent Identity Lock: Once a user is verified, their identity and vibrant GREEN BORDER (0, 255, 0)
+      remain locked even while moving around the room.
     """
 
     def __init__(
         self,
         fps: int = 30,
-        track_activation_threshold: float = 0.35,
+        track_activation_threshold: float = 0.20,
         lost_track_buffer: int = 30,
-        minimum_matching_threshold: float = 0.70,
+        minimum_matching_threshold: float = 0.30,
         recheck_interval_frames: int = 30,
-        min_face_size_for_recognition: int = 40,
+        min_face_size_for_recognition: int = 16,  # Recognizes distant faces down to 16x16px
+        max_velocity_for_recognition: float = 25.0,  # px per frame
     ):
         self.fps = max(1, fps)
         self.recheck_interval_frames = max(1, recheck_interval_frames)
         self.lost_track_buffer = lost_track_buffer
         self.min_face_size_for_recognition = min_face_size_for_recognition
+        self.max_velocity_for_recognition = max_velocity_for_recognition
 
         self.tracker = sv.ByteTrack(
             track_activation_threshold=track_activation_threshold,
@@ -50,6 +55,7 @@ class FaceTrackerManager:
 
         self.identity_cache: dict[int, dict] = {}
         self.frame_index: int = 0
+        self.last_valid_raw_faces = np.empty((0, 15), dtype=np.float32)
 
     @staticmethod
     def _compute_iou(boxA: np.ndarray | tuple | list, boxB: np.ndarray | tuple | list) -> float:
@@ -81,7 +87,7 @@ class FaceTrackerManager:
                 best_iou = iou
                 best_face = face
 
-        if best_iou >= 0.20:
+        if best_iou >= 0.10:
             return best_face
         return None
 
@@ -97,19 +103,22 @@ class FaceTrackerManager:
         self.frame_index += 1
         fh, fw = frame.shape[:2]
 
-        # 1. Filter valid detections by score
+        # 1. Filter valid detections
         valid_faces = []
         if raw_faces is not None and len(raw_faces) > 0:
             for f in raw_faces:
                 det_score = float(f[14]) if len(f) > 14 else 1.0
-                if det_score >= 0.30:
+                if det_score >= 0.20:
                     valid_faces.append(f)
+            self.last_valid_raw_faces = np.array(valid_faces)
+        elif raw_faces is not None:
+            self.last_valid_raw_faces = np.empty((0, 15), dtype=np.float32)
 
-        # 2. Build supervision Detections in XYXY format
-        if valid_faces:
+        # 2. Build supervision Detections
+        if len(self.last_valid_raw_faces) > 0:
             xyxy_boxes = []
             confidences = []
-            for f in valid_faces:
+            for f in self.last_valid_raw_faces:
                 x, y, w, h = f[:4]
                 x1 = float(np.clip(x, 0, fw - 1))
                 y1 = float(np.clip(y, 0, fh - 1))
@@ -142,9 +151,9 @@ class FaceTrackerManager:
             or (self.frame_index - data.get("last_evaluated_frame", self.frame_index)) <= self.lost_track_buffer * 2
         }
 
-        # 5. Process tracked faces with Distance & Resolution Gating
+        # 5. Process tracked faces
         tracked_faces: list[TrackedFace] = []
-        raw_faces_array = np.array(valid_faces) if valid_faces else np.empty((0, 15))
+        raw_faces_array = self.last_valid_raw_faces
 
         for idx in range(len(tracked_detections)):
             track_id = int(tracked_detections.tracker_id[idx])
@@ -161,17 +170,37 @@ class FaceTrackerManager:
             bw = int(max(1, min(fw - bx, x2 - x1)))
             bh = int(max(1, min(fh - by, y2 - y1)))
             bbox_xywh = (bx, by, bw, bh)
+            center = (bx + bw / 2.0, by + bh / 2.0)
 
-            # Resolution Gating: Check if face is close enough for reliable recognition
+            # Retrieve track history
+            cached_info = self.identity_cache.get(track_id, {})
+            prev_center = cached_info.get("prev_center")
+            prev_frame = cached_info.get("prev_frame", self.frame_index - 1)
+            dt = max(1, self.frame_index - prev_frame)
+
+            # Calculate motion velocity (pixels/frame)
+            if prev_center is not None:
+                dx = center[0] - prev_center[0]
+                dy = center[1] - prev_center[1]
+                velocity = float(np.sqrt(dx * dx + dy * dy) / dt)
+            else:
+                velocity = 0.0
+
+            # Fast motion test strictly based on spatial velocity
+            is_fast_motion = (
+                (velocity > self.max_velocity_for_recognition and dt <= 2)
+                or (bw > 0 and velocity > bw * 0.45 and dt <= 2)
+            )
+
             is_too_small = min(bw, bh) < self.min_face_size_for_recognition
+            already_recognized = cached_info.get("is_rec", False)
 
-            cached_info = self.identity_cache.get(track_id)
             needs_eval = (
-                not is_too_small
+                not is_fast_motion
+                and not is_too_small
                 and (
-                    cached_info is None
-                    or not cached_info.get("evaluated_close", False)
-                    or (self.frame_index - cached_info["last_evaluated_frame"]) >= self.recheck_interval_frames
+                    not cached_info.get("evaluated", False)
+                    or (self.frame_index - cached_info.get("last_evaluated_frame", 0)) >= self.recheck_interval_frames
                 )
             )
 
@@ -190,12 +219,20 @@ class FaceTrackerManager:
                 if embeddings and enrolled_matrix is not None and len(known_users) > 0:
                     emb = embeddings[0]
                     sims = recognition_service.batch_cosine_similarity(emb, enrolled_matrix)
-                    best_idx = int(np.argmax(sims))
-                    highest_score = float(sims[best_idx])
-                    best_match_user = known_users[best_idx]
-                    is_rec = highest_score >= match_threshold and best_match_user is not None
+                    if len(sims) > 0:
+                        best_idx = int(np.argmax(sims))
+                        highest_score = float(sims[best_idx])
+                        best_match_user = known_users[best_idx]
+                        is_rec = highest_score >= match_threshold and best_match_user is not None
 
-                name = best_match_user["name"] if (is_rec and best_match_user) else "Unknown"
+                if not is_rec and already_recognized:
+                    # Keep previous high-confidence identity during momentary fluctuations
+                    name = cached_info.get("name", "Unknown")
+                    highest_score = cached_info.get("score", 0.80)
+                    is_rec = True
+                    best_match_user = cached_info.get("user_data")
+                else:
+                    name = best_match_user["name"] if (is_rec and best_match_user) else "Unknown"
 
                 self.identity_cache[track_id] = {
                     "name": name,
@@ -203,26 +240,36 @@ class FaceTrackerManager:
                     "is_rec": is_rec,
                     "user_data": best_match_user,
                     "last_evaluated_frame": self.frame_index,
-                    "evaluated_close": True,
+                    "evaluated": True,
+                    "prev_center": center,
+                    "prev_frame": self.frame_index,
+                    "velocity": velocity,
                 }
                 cached_info = self.identity_cache[track_id]
-            elif cached_info is None:
-                # Distant face being tracked before reaching resolution threshold
-                self.identity_cache[track_id] = {
-                    "name": "Tracking...",
-                    "score": 0.0,
-                    "is_rec": False,
-                    "user_data": None,
-                    "last_evaluated_frame": self.frame_index,
-                    "evaluated_close": False,
-                }
-                cached_info = self.identity_cache[track_id]
+            else:
+                cached_info["prev_center"] = center
+                cached_info["prev_frame"] = self.frame_index
+                cached_info["velocity"] = velocity
+                self.identity_cache[track_id] = cached_info
 
-            name = cached_info["name"]
-            score = cached_info["score"]
-            is_rec = cached_info["is_rec"]
-            user_data = cached_info["user_data"]
-            color = (0, 255, 0) if is_rec else ((255, 200, 0) if is_too_small else (0, 0, 255))
+            # PERSISTENT IDENTITY LOCK:
+            # Verified identity remains locked with GREEN BORDER (0, 255, 0)
+            if already_recognized or cached_info.get("is_rec", False):
+                name = cached_info.get("name", "Recognized")
+                is_rec = True
+                score = cached_info.get("score", 0.80)
+                color = (0, 255, 0)  # VIBRANT SOLID GREEN BORDER LOCKED
+                user_data = cached_info.get("user_data")
+            else:
+                name = cached_info.get("name", "Unknown")
+                is_rec = False
+                score = cached_info.get("score", 0.0)
+                user_data = cached_info.get("user_data")
+                if is_too_small:
+                    color = (255, 200, 0)
+                    name = "Tracking..."
+                else:
+                    color = (0, 0, 255)  # Red border for unverified / unknown
 
             tracked_faces.append(
                 TrackedFace(
@@ -235,6 +282,8 @@ class FaceTrackerManager:
                     user_data=user_data,
                     landmarks=matched_raw_face,
                     raw_detection_score=det_conf,
+                    is_fast_motion=is_fast_motion,
+                    velocity=velocity,
                 )
             )
 

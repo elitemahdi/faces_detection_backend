@@ -24,10 +24,14 @@ from app.services.zone_service import zone_engine
 
 
 def _capture_fallback_frame(source: str, w: int, h: int) -> np.ndarray | None:
-    """Synchronous fallback worker for capturing a single background frame without blocking event loop."""
+    """Safe fallback worker for capturing a single background frame.
+    Avoids opening local webcams (indices like '0') if already held by an active stream to prevent MSMF driver crashes.
+    """
+    if str(source).strip().isdigit():
+        # Local webcam: Avoid opening concurrent handle
+        return None
     try:
-        device_src = int(source) if source.isdigit() else source
-        cap = cv2.VideoCapture(device_src)
+        cap = cv2.VideoCapture(source)
         if cap.isOpened():
             ret, frame = cap.read()
             cap.release()

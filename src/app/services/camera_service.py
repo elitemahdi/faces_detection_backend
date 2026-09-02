@@ -1,4 +1,6 @@
 import asyncio
+import threading
+import time
 from typing import AsyncGenerator
 
 import cv2
@@ -18,6 +20,56 @@ from app.services.tracking_service import FaceTrackerManager
 from app.services.zone_service import zone_engine
 
 MATCH_THRESHOLD = 0.38
+
+
+class ThreadedCameraReader:
+    """Non-blocking background camera reader.
+    Prevents OpenCV frame buffer backlog and ensures real-time zero-latency frame delivery at 30+ FPS.
+    """
+
+    def __init__(self, source: int | str):
+        self.source = source
+        self.cap = cv2.VideoCapture(source)
+        self.running = True
+        self.latest_frame = None
+        self.ret = False
+        self.lock = threading.Lock()
+        self.thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.thread.start()
+
+    def _reader_loop(self):
+        while self.running and self.cap.isOpened():
+            try:
+                ret, frame = self.cap.read()
+                if not ret or frame is None:
+                    time.sleep(0.01)
+                    continue
+                with self.lock:
+                    self.latest_frame = frame
+                    self.ret = ret
+                time.sleep(0.005)  # Pace reads to avoid MSMF buffer overload
+            except Exception:
+                time.sleep(0.01)
+
+    def isOpened(self) -> bool:
+        return self.cap.isOpened()
+
+    def get_dimensions(self) -> tuple[int, int]:
+        w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
+        h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+        return w, h
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        with self.lock:
+            if not self.ret or self.latest_frame is None:
+                return False, None
+            return True, self.latest_frame.copy()
+
+    def release(self):
+        self.running = False
+        if self.thread.is_alive():
+            self.thread.join(timeout=0.3)
+        self.cap.release()
 
 
 async def _persist_detection_events(events: list[dict]) -> None:
@@ -63,7 +115,7 @@ class CameraService:
         return ret
 
     async def register_camera(
-            self, camera_in: CameraCreate, verify_connection: bool = False
+        self, camera_in: CameraCreate, verify_connection: bool = False
     ) -> CameraResponse:
         existing = await self.repository.get_by_name(camera_in.name)
         if existing:
@@ -93,7 +145,7 @@ class CameraService:
         return CameraResponse.model_validate(camera)
 
     async def list_cameras(
-            self, skip: int = 0, limit: int = 50, active_only: bool = False
+        self, skip: int = 0, limit: int = 50, active_only: bool = False
     ) -> list[CameraResponse]:
         cameras = await self.repository.list_all(
             skip=skip, limit=limit, active_only=active_only
@@ -101,7 +153,7 @@ class CameraService:
         return [CameraResponse.model_validate(cam) for cam in cameras]
 
     async def update_camera(
-            self, camera_id: int, camera_in: CameraUpdate
+        self, camera_id: int, camera_in: CameraUpdate
     ) -> CameraResponse:
         camera = await self.repository.get_by_id(camera_id)
         if not camera:
@@ -148,12 +200,12 @@ class CameraService:
         }
 
     async def stream_camera_feed(
-            self,
-            camera_id: int,
-            annotate_faces: bool = True,
-            match_threshold: float = MATCH_THRESHOLD,
+        self,
+        camera_id: int,
+        annotate_faces: bool = True,
+        match_threshold: float = MATCH_THRESHOLD,
     ) -> AsyncGenerator[bytes, None]:
-        """Streams live camera frames via MJPEG multipart stream with real-time AI face recognition & zone rules."""
+        """Streams live camera frames via MJPEG with real-time AI recognition, motion gating, and 30+ FPS throughput."""
         camera = await self.repository.get_by_id(camera_id)
         if not camera:
             raise HTTPException(
@@ -161,7 +213,7 @@ class CameraService:
                 detail="Camera not found.",
             )
 
-        # 1. Preload enrolled users matrix for vectorized matching
+        # 1. Preload enrolled users
         users = await self.user_repository.list_all(skip=0, limit=1000)
         known_users = [
             {
@@ -184,14 +236,13 @@ class CameraService:
         else:
             enrolled_matrix = None
 
-        # 2. Preload active security zones for this camera
         active_zones = await self.zone_repository.list_by_camera(camera_id, active_only=True)
 
         device_src = int(camera.source) if camera.source.isdigit() else camera.source
-        cap = cv2.VideoCapture(device_src)
+        reader = ThreadedCameraReader(device_src)
 
         try:
-            if not cap.isOpened():
+            if not reader.isOpened():
                 err_frame = np.zeros((480, 640, 3), dtype=np.uint8)
                 cv2.putText(
                     err_frame,
@@ -202,31 +253,21 @@ class CameraService:
                     (0, 0, 255),
                     2,
                 )
-                cv2.putText(
-                    err_frame,
-                    f"Source: {camera.source}",
-                    (30, 260),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (200, 200, 200),
-                    1,
-                )
-                ret, buf = cv2.imencode(".jpg", err_frame)
+                ret, buf = cv2.imencode(".jpg", err_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
                 if ret:
                     yield (
-                            b"--frame\r\n"
-                            b"Content-Type: image/jpeg\r\n\r\n"
-                            + buf.tobytes()
-                            + b"\r\n"
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n\r\n"
+                        + buf.tobytes()
+                        + b"\r\n"
                     )
                 return
 
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+            w, h = reader.get_dimensions()
             detector = self.recognition_service.get_detector((w, h))
             tracker_manager = FaceTrackerManager(
                 fps=30,
-                recheck_interval_frames=60,
+                recheck_interval_frames=25,
             )
 
             frame_count = 0
@@ -237,22 +278,21 @@ class CameraService:
             zones_with_contours = []
             background_tasks: set[asyncio.Task] = set()
 
-            while cap.isOpened():
-                ret, frame = await asyncio.to_thread(cap.read)
-                if not ret:
+            while reader.isOpened():
+                ret, frame = await asyncio.to_thread(reader.read)
+                if not ret or frame is None:
                     fail_count += 1
-                    if fail_count > 30:
+                    if fail_count > 60:
                         break
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.01)
                     continue
 
                 fail_count = 0
                 frame_cache.set(camera_id, frame)
-
                 frame_count += 1
                 fh, fw, _ = frame.shape
 
-                # Cache denormalized zone contours and only recompute when resolution changes
+                # Cache denormalized zone contours
                 if cached_resolution != (fw, fh):
                     zones_with_contours = [
                         (z, zone_engine.denormalize_points(z.coordinates, fw, fh))
@@ -261,10 +301,13 @@ class CameraService:
                     cached_resolution = (fw, fh)
 
                 if annotate_faces:
-                    last_annotations = []
-                    last_breached_zones = set()
-                    detector.setInputSize((fw, fh))
-                    _, raw_faces = detector.detect(frame)
+                    # Run deep detector every 2 frames; on intermediate frames, ByteTrack tracks smoothly
+                    run_detection = (frame_count % 2 == 1) or (frame_count < 5)
+                    if run_detection:
+                        detector.setInputSize((fw, fh))
+                        _, raw_faces = detector.detect(frame)
+                    else:
+                        raw_faces = None
 
                     tracked_faces = tracker_manager.update(
                         frame=frame,
@@ -275,15 +318,18 @@ class CameraService:
                         match_threshold=match_threshold,
                     )
 
+                    last_annotations = []
+                    last_breached_zones = set()
                     events_to_log = []
+
                     for tf in tracked_faces:
                         bx, by, bw, bh = tf.bbox_xywh
                         face_center = (bx + bw // 2, by + bh // 2)
 
                         in_zone = False
                         matched_zone_id = None
-                        label = f"ID:{tf.track_id} | {tf.name} ({tf.confidence:.2f})"
-                        color = tf.color_bgr
+                        label = f"{tf.name} ({tf.confidence:.2f})" if tf.is_recognized else tf.name
+                        color = tf.color_bgr  # Green (0, 255, 0) when recognized, Red/Orange when fast/unknown
 
                         for zone_obj, contour in zones_with_contours:
                             if zone_engine.is_point_in_zone(face_center, contour):
@@ -297,14 +343,13 @@ class CameraService:
                                     zone_name=zone_obj.name,
                                 )
                                 color = z_check.color_bgr
-                                label = f"ID:{tf.track_id} | {z_check.message}"
+                                label = f"{tf.name} | {z_check.message}"
                                 if z_check.is_violation:
                                     last_breached_zones.add(zone_obj.id)
                                 break
 
-                        last_annotations.append((tf.bbox_xywh, label, color))
+                        last_annotations.append((tf.bbox_xywh, label, color, tf.is_recognized))
 
-                        # Prepare spatial event for heatmap logging
                         events_to_log.append({
                             "camera_id": camera_id,
                             "user_id": tf.user_data["id"] if (tf.is_recognized and tf.user_data) else None,
@@ -316,78 +361,80 @@ class CameraService:
                             "zone_id": matched_zone_id,
                         })
 
-                    # Sample detection event logging every 10 frames (~3x per sec) with task GC protection
+                    # Log events every 10 frames (~3x per sec)
                     if frame_count % 10 == 0 and events_to_log:
                         persist_task = asyncio.create_task(_persist_detection_events(events_to_log))
                         background_tasks.add(persist_task)
                         persist_task.add_done_callback(background_tasks.discard)
 
-                    # 1. Render semi-transparent zone polygons onto frame
+                    # 1. Render zone polygons
                     if zones_with_contours:
                         frame = zone_engine.render_zones_on_frame(
                             frame, zones_with_contours, last_breached_zones
                         )
 
-                    # 2. Render face bounding boxes and violation tags
-                    for bbox, label, color in last_annotations:
+                    # 2. Render bounding boxes and HUD tags
+                    for bbox, label, color, is_rec in last_annotations:
                         bx, by, bw, bh = bbox
+                        thickness = 3 if is_rec else 2
                         cv2.rectangle(
-                            frame, (bx, by), (bx + bw, by + bh), color, 2
+                            frame, (bx, by), (bx + bw, by + bh), color, thickness
                         )
                         (tw, th), _ = cv2.getTextSize(
                             label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1
                         )
                         cv2.rectangle(
                             frame,
-                            (bx, max(0, by - 22)),
-                            (bx + tw + 8, max(22, by)),
+                            (bx, max(0, by - 24)),
+                            (bx + tw + 8, max(24, by)),
                             color,
                             -1,
                         )
                         cv2.putText(
                             frame,
                             label,
-                            (bx + 4, max(16, by - 6)),
+                            (bx + 4, max(18, by - 6)),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.48,
-                            (255, 255, 255),
+                            (255, 255, 255) if color != (0, 255, 0) else (0, 0, 0),
                             1,
                             cv2.LINE_AA,
                         )
                 else:
-                    # Still render zone polygons if annotations are off but zones exist
                     if zones_with_contours:
                         frame = zone_engine.render_zones_on_frame(
                             frame, zones_with_contours, set()
                         )
 
+                # Fast JPEG compression
                 ret, buffer = cv2.imencode(
-                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80]
+                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75]
                 )
                 if not ret:
                     continue
 
                 yield (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n\r\n"
-                        + buffer.tobytes()
-                        + b"\r\n"
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n"
+                    + buffer.tobytes()
+                    + b"\r\n"
                 )
 
-                await asyncio.sleep(0.033)
+                # Non-blocking yield to event loop
+                await asyncio.sleep(0.001)
 
         finally:
             frame_cache.remove(camera_id)
-            cap.release()
+            reader.release()
 
     async def stream_camera_websocket(
-            self,
-            websocket: WebSocket,
-            camera_id: int,
-            annotate_faces: bool = True,
-            match_threshold: float = MATCH_THRESHOLD,
+        self,
+        websocket: WebSocket,
+        camera_id: int,
+        annotate_faces: bool = True,
+        match_threshold: float = MATCH_THRESHOLD,
     ):
-        """Streams live camera frames via WebSocket with real-time AI face recognition, zone security policies, and bidirectional controls."""
+        """Streams live camera frames via WebSocket with real-time AI recognition, motion gating, and 30+ FPS throughput."""
         camera = await self.repository.get_by_id(camera_id)
         if not camera:
             await websocket.close(
@@ -421,9 +468,9 @@ class CameraService:
         active_zones = await self.zone_repository.list_by_camera(camera_id, active_only=True)
 
         device_src = int(camera.source) if camera.source.isdigit() else camera.source
-        cap = cv2.VideoCapture(device_src)
+        reader = ThreadedCameraReader(device_src)
 
-        if not cap.isOpened():
+        if not reader.isOpened():
             err_frame = np.zeros((480, 640, 3), dtype=np.uint8)
             cv2.putText(
                 err_frame,
@@ -434,7 +481,7 @@ class CameraService:
                 (0, 0, 255),
                 2,
             )
-            ret, buf = cv2.imencode(".jpg", err_frame)
+            ret, buf = cv2.imencode(".jpg", err_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
             if ret:
                 await websocket.send_bytes(buf.tobytes())
             await websocket.close(
@@ -443,8 +490,7 @@ class CameraService:
             )
             return
 
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+        w, h = reader.get_dimensions()
         detector = self.recognition_service.get_detector((w, h))
 
         current_annotate = annotate_faces
@@ -470,7 +516,7 @@ class CameraService:
         try:
             tracker_manager = FaceTrackerManager(
                 fps=30,
-                recheck_interval_frames=60,
+                recheck_interval_frames=25,
             )
             frame_count = 0
             fail_count = 0
@@ -480,22 +526,20 @@ class CameraService:
             zones_with_contours = []
             background_tasks: set[asyncio.Task] = set()
 
-            while cap.isOpened():
-                ret, frame = await asyncio.to_thread(cap.read)
-                if not ret:
+            while reader.isOpened():
+                ret, frame = await asyncio.to_thread(reader.read)
+                if not ret or frame is None:
                     fail_count += 1
-                    if fail_count > 30:
+                    if fail_count > 60:
                         break
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.01)
                     continue
 
                 fail_count = 0
                 frame_cache.set(camera_id, frame)
-
                 frame_count += 1
                 fh, fw, _ = frame.shape
 
-                # Cache denormalized zone contours and only recompute when resolution changes
                 if cached_resolution != (fw, fh):
                     zones_with_contours = [
                         (z, zone_engine.denormalize_points(z.coordinates, fw, fh))
@@ -504,10 +548,12 @@ class CameraService:
                     cached_resolution = (fw, fh)
 
                 if current_annotate:
-                    last_annotations = []
-                    last_breached_zones = set()
-                    detector.setInputSize((fw, fh))
-                    _, raw_faces = detector.detect(frame)
+                    run_detection = (frame_count % 2 == 1) or (frame_count < 5)
+                    if run_detection:
+                        detector.setInputSize((fw, fh))
+                        _, raw_faces = detector.detect(frame)
+                    else:
+                        raw_faces = None
 
                     tracked_faces = tracker_manager.update(
                         frame=frame,
@@ -518,14 +564,17 @@ class CameraService:
                         match_threshold=current_threshold,
                     )
 
-                    ws_events_to_log = []
+                    last_annotations = []
+                    last_breached_zones = set()
+                    events_to_log = []
+
                     for tf in tracked_faces:
                         bx, by, bw, bh = tf.bbox_xywh
                         face_center = (bx + bw // 2, by + bh // 2)
 
                         in_zone = False
                         matched_zone_id = None
-                        label = f"ID:{tf.track_id} | {tf.name} ({tf.confidence:.2f})"
+                        label = f"{tf.name} ({tf.confidence:.2f})" if tf.is_recognized else tf.name
                         color = tf.color_bgr
 
                         for zone_obj, contour in zones_with_contours:
@@ -540,15 +589,14 @@ class CameraService:
                                     zone_name=zone_obj.name,
                                 )
                                 color = z_check.color_bgr
-                                label = f"ID:{tf.track_id} | {z_check.message}"
+                                label = f"{tf.name} | {z_check.message}"
                                 if z_check.is_violation:
                                     last_breached_zones.add(zone_obj.id)
                                 break
 
-                        last_annotations.append((tf.bbox_xywh, label, color))
+                        last_annotations.append((tf.bbox_xywh, label, color, tf.is_recognized))
 
-                        # Prepare spatial event for heatmap logging
-                        ws_events_to_log.append({
+                        events_to_log.append({
                             "camera_id": camera_id,
                             "user_id": tf.user_data["id"] if (tf.is_recognized and tf.user_data) else None,
                             "user_name": tf.name if tf.is_recognized else None,
@@ -559,39 +607,39 @@ class CameraService:
                             "zone_id": matched_zone_id,
                         })
 
-                    # Sample detection event logging every 10 frames (~3x per sec) with task GC protection
-                    if frame_count % 10 == 0 and ws_events_to_log:
-                        ws_persist_task = asyncio.create_task(_persist_detection_events(ws_events_to_log))
-                        background_tasks.add(ws_persist_task)
-                        ws_persist_task.add_done_callback(background_tasks.discard)
+                    if frame_count % 10 == 0 and events_to_log:
+                        persist_task = asyncio.create_task(_persist_detection_events(events_to_log))
+                        background_tasks.add(persist_task)
+                        persist_task.add_done_callback(background_tasks.discard)
 
                     if zones_with_contours:
                         frame = zone_engine.render_zones_on_frame(
                             frame, zones_with_contours, last_breached_zones
                         )
 
-                    for bbox, label, color in last_annotations:
+                    for bbox, label, color, is_rec in last_annotations:
                         bx, by, bw, bh = bbox
+                        thickness = 3 if is_rec else 2
                         cv2.rectangle(
-                            frame, (bx, by), (bx + bw, by + bh), color, 2
+                            frame, (bx, by), (bx + bw, by + bh), color, thickness
                         )
                         (tw, th), _ = cv2.getTextSize(
                             label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1
                         )
                         cv2.rectangle(
                             frame,
-                            (bx, max(0, by - 22)),
-                            (bx + tw + 8, max(22, by)),
+                            (bx, max(0, by - 24)),
+                            (bx + tw + 8, max(24, by)),
                             color,
                             -1,
                         )
                         cv2.putText(
                             frame,
                             label,
-                            (bx + 4, max(16, by - 6)),
+                            (bx + 4, max(18, by - 6)),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.48,
-                            (255, 255, 255),
+                            (255, 255, 255) if color != (0, 255, 0) else (0, 0, 0),
                             1,
                             cv2.LINE_AA,
                         )
@@ -602,29 +650,32 @@ class CameraService:
                         )
 
                 ret, buffer = cv2.imencode(
-                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80]
+                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75]
                 )
-                if ret:
+                if not ret:
+                    continue
+
+                try:
                     await websocket.send_bytes(buffer.tobytes())
+                except WebSocketDisconnect:
+                    break
+                except Exception:
+                    break
 
-                await asyncio.sleep(0.033)
+                await asyncio.sleep(0.001)
 
-        except WebSocketDisconnect:
-            pass
-        except Exception:
-            pass
         finally:
-            frame_cache.remove(camera_id)
             recv_task.cancel()
-            cap.release()
+            frame_cache.remove(camera_id)
+            reader.release()
 
     async def get_snapshot(
-            self,
-            camera_id: int,
-            annotate_faces: bool = True,
-            match_threshold: float = MATCH_THRESHOLD,
+        self,
+        camera_id: int,
+        annotate_faces: bool = True,
+        match_threshold: float = MATCH_THRESHOLD,
     ) -> bytes:
-        """Captures a single annotated JPEG frame from the camera with zone policies."""
+        """Captures a single high-resolution JPEG frame from the camera with optional face annotations and zone overlays."""
         camera = await self.repository.get_by_id(camera_id)
         if not camera:
             raise HTTPException(
@@ -632,100 +683,111 @@ class CameraService:
                 detail="Camera not found.",
             )
 
-        device_src = int(camera.source) if camera.source.isdigit() else camera.source
-        cap = await asyncio.to_thread(cv2.VideoCapture, device_src)
-        if not cap.isOpened():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unable to connect to camera source '{camera.source}'.",
-            )
+        frame = frame_cache.get(camera_id)
+        if frame is None:
+            device_src = int(camera.source) if camera.source.isdigit() else camera.source
+            cap = cv2.VideoCapture(device_src)
+            if not cap.isOpened():
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Could not open camera stream '{camera.name}'.",
+                )
+            ret, frame = cap.read()
+            cap.release()
+            if not ret or frame is None:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to capture snapshot frame from camera.",
+                )
 
-        ret, frame = await asyncio.to_thread(cap.read)
-        await asyncio.to_thread(cap.release)
-
-        if not ret or frame is None:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to capture frame from camera.",
-            )
-
+        frame = frame.copy()
         fh, fw, _ = frame.shape
-        active_zones = await self.zone_repository.list_by_camera(camera_id, active_only=True)
-        zones_with_contours = [
-            (z, zone_engine.denormalize_points(z.coordinates, fw, fh))
-            for z in active_zones
-        ]
 
         if annotate_faces:
+            users = await self.user_repository.list_all(skip=0, limit=1000)
+            known_users = [
+                {
+                    "id": u.id,
+                    "name": u.full_name,
+                    "role": u.role.value if hasattr(u.role, "value") else str(u.role),
+                    "embedding": np.array(u.embedding, dtype=np.float32),
+                }
+                for u in users
+                if u.embedding is not None
+            ]
+            if known_users:
+                enrolled_matrix = np.array(
+                    [u["embedding"] for u in known_users], dtype=np.float32
+                )
+                norms = np.linalg.norm(enrolled_matrix, axis=1, keepdims=True)
+                norms[norms < 1e-6] = 1.0
+                enrolled_matrix = enrolled_matrix / norms
+            else:
+                enrolled_matrix = None
+
+            active_zones = await self.zone_repository.list_by_camera(camera_id, active_only=True)
+            zones_with_contours = [
+                (z, zone_engine.denormalize_points(z.coordinates, fw, fh))
+                for z in active_zones
+            ]
+
             detector = self.recognition_service.get_detector((fw, fh))
-            _, faces = detector.detect(frame)
+            _, raw_faces = detector.detect(frame)
+
+            tracker_manager = FaceTrackerManager(fps=30)
+            tracked_faces = tracker_manager.update(
+                frame=frame,
+                raw_faces=raw_faces,
+                recognition_service=self.recognition_service,
+                enrolled_matrix=enrolled_matrix,
+                known_users=known_users,
+                match_threshold=match_threshold,
+            )
+
             breached_zones = set()
+            for tf in tracked_faces:
+                bx, by, bw, bh = tf.bbox_xywh
+                face_center = (bx + bw // 2, by + bh // 2)
+                label = f"{tf.name} ({tf.confidence:.2f})" if tf.is_recognized else tf.name
+                color = tf.color_bgr
 
-            if faces is not None and len(faces) > 0:
-                users = await self.user_repository.list_all(skip=0, limit=1000)
-                known_users = [
-                    {
-                        "id": u.id,
-                        "name": u.full_name,
-                        "role": u.role.value if hasattr(u.role, "value") else str(u.role),
-                        "embedding": np.array(u.embedding, dtype=np.float32),
-                    }
-                    for u in users if u.embedding is not None
-                ]
-                if known_users:
-                    enrolled_matrix = np.array([u["embedding"] for u in known_users], dtype=np.float32)
-                    norms = np.linalg.norm(enrolled_matrix, axis=1, keepdims=True)
-                    norms[norms < 1e-6] = 1.0
-                    enrolled_matrix = enrolled_matrix / norms
-                else:
-                    enrolled_matrix = None
+                for zone_obj, contour in zones_with_contours:
+                    if zone_engine.is_point_in_zone(face_center, contour):
+                        z_check = zone_engine.evaluate_zone_rule(
+                            zone_type=zone_obj.zone_type,
+                            matched_user=tf.user_data,
+                            is_recognized=tf.is_recognized,
+                            face_detected=True,
+                            zone_name=zone_obj.name,
+                        )
+                        color = z_check.color_bgr
+                        label = f"{tf.name} | {z_check.message}"
+                        if z_check.is_violation:
+                            breached_zones.add(zone_obj.id)
+                        break
 
-                bboxes = [f[:4].astype(int) for f in faces]
-                crops = [self.recognition_service.align_and_crop(frame, f) for f in faces]
-                embeddings = self.recognition_service.extract_batch_embeddings(crops)
-
-                for bbox, emb in zip(bboxes, embeddings):
-                    bx, by, bw, bh = bbox
-                    face_center = (bx + bw // 2, by + bh // 2)
-
-                    best_match_user = None
-                    highest_score = -1.0
-                    if enrolled_matrix is not None and len(known_users) > 0:
-                        sims = self.recognition_service.batch_cosine_similarity(emb, enrolled_matrix)
-                        best_idx = int(np.argmax(sims))
-                        highest_score = float(sims[best_idx])
-                        best_match_user = known_users[best_idx]
-
-                    is_rec = highest_score >= match_threshold and best_match_user is not None
-                    label = f"{best_match_user['name']} ({highest_score:.2f})" if is_rec else f"Unknown ({highest_score:.2f})"
-                    color = (0, 255, 0) if is_rec else (0, 0, 255)
-
-                    for zone_obj, contour in zones_with_contours:
-                        if zone_engine.is_point_in_zone(face_center, contour):
-                            z_check = zone_engine.evaluate_zone_rule(
-                                zone_type=zone_obj.zone_type,
-                                matched_user=best_match_user,
-                                is_recognized=is_rec,
-                                face_detected=True,
-                                zone_name=zone_obj.name,
-                            )
-                            color = z_check.color_bgr
-                            label = z_check.message
-                            if z_check.is_violation:
-                                breached_zones.add(zone_obj.id)
-                            break
-
-                    cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), color, 2)
-                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
-                    cv2.rectangle(frame, (bx, max(0, by - 22)), (bx + tw + 8, max(22, by)), color, -1)
-                    cv2.putText(frame, label, (bx + 4, max(16, by - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
-                                (255, 255, 255), 1, cv2.LINE_AA)
+                thickness = 3 if tf.is_recognized else 2
+                cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), color, thickness)
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+                cv2.rectangle(frame, (bx, max(0, by - 24)), (bx + tw + 8, max(24, by)), color, -1)
+                cv2.putText(
+                    frame,
+                    label,
+                    (bx + 4, max(18, by - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    (255, 255, 255) if color != (0, 255, 0) else (0, 0, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
 
             if zones_with_contours:
                 frame = zone_engine.render_zones_on_frame(frame, zones_with_contours, breached_zones)
-        else:
-            if zones_with_contours:
-                frame = zone_engine.render_zones_on_frame(frame, zones_with_contours, set())
 
         ret, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ret:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to encode snapshot image.",
+            )
         return buffer.tobytes()
